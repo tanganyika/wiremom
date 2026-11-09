@@ -1,14 +1,14 @@
 """W3DZZ five-band trap dipole (ARRL Antenna Handbook design, as used for the
 coax-trap-form project): 32 ft inner sections, 60 pF / 8.2 uH traps, 22 ft outer
-sections, fed with 75 ohm, 10 m above a perfect ground plane.
+sections, fed with 75 ohm, 10 m above ground.
 
 Run:  python3 examples/w3dzz_trap_dipole.py
+      GROUND=pec python3 examples/w3dzz_trap_dipole.py     (or poor, "very good", ...)
 
-Real (lossy) ground is not modelled yet, so absolute impedances will differ from
-an antenna over real soil; the band-by-band resonance pattern is what to look at.
-With these exact dimensions 80/40/20 m work and 15/10 m resonate outside the
-bands, which nec2c agrees with (checked at 3.8-28.5 MHz, trap on the first
-outer segment there): real W3DZZ builds trim the outer wires for the high bands.
+The default is "average" soil (eps_r 13, 5 mS/m) via the Sommerfeld solution;
+efficiency then includes the power the ground absorbs.  With these exact
+dimensions 80/40/20 m work and 15/10 m resonate outside the bands, which nec2c
+agrees with: real W3DZZ builds trim the outer wires for the high bands.
 """
 
 import math
@@ -33,7 +33,7 @@ st = Structure()
 st.add_wire([0, -INNER, H], [0, INNER, H], A, 40, conductivity=CU)       # tag 1
 st.add_wire([0, INNER, H], [0, INNER + OUTER, H], A, 14, conductivity=CU)   # tag 2
 st.add_wire([0, -INNER, H], [0, -INNER - OUTER, H], A, 14, conductivity=CU)  # tag 3
-m = Model(st, ground="pec")
+m = Model(st, ground=os.environ.get("GROUND", "average"))
 m.add_source(1, 20)
 for tag in (2, 3):  # trap at the joint between inner and outer wire (outer wire node 0)
     m.add_load(tag, 0, l=L_TRAP, c=C_TRAP, r=Q_TRAP * 2 * math.pi * F_TRAP * L_TRAP, parallel=True)

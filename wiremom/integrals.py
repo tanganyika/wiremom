@@ -22,12 +22,23 @@ with shapes 0 = rising (u/L) and 1 = falling (1 - u/L).
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 
 
-def gauss01(n: int):
+@lru_cache(maxsize=64)
+def _gauss01(n: int):
     x, w = np.polynomial.legendre.leggauss(n)
-    return 0.5 * (x + 1.0), 0.5 * w
+    x, w = 0.5 * (x + 1.0), 0.5 * w
+    x.flags.writeable = False
+    w.flags.writeable = False
+    return x, w
+
+
+def gauss01(n: int):
+    """Gauss-Legendre nodes and weights on [0, 1] (cached, read-only)."""
+    return _gauss01(int(n))
 
 
 def segment_integrals(p0, t, length, radius, k: float, n_outer: int = 8, n_inner: int = 8,

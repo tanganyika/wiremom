@@ -42,7 +42,7 @@ class Case:
     wires: list[W]
     feed: tuple[int, str]  # (wire index from 1, "centre" | "base")
     loads: list[tuple[int, dict]] = field(default_factory=list)  # (wire, load kwargs), centre
-    ground: str | None = None
+    ground: object = None  # None, "pec" or (eps_r, sigma) for Sommerfeld ground
     directions: list[tuple[float, float]] = field(default_factory=lambda: [(90.0, 0.0)])
 
 
@@ -66,9 +66,12 @@ def nec_deck(case: Case) -> str:
     for i, w in enumerate(case.wires, 1):
         n = w.nseg + 1 if w.centred else w.nseg
         lines.append("GW %d %d %.9g %.9g %.9g %.9g %.9g %.9g %.9g" % (i, n, *w.start, *w.end, w.radius))
-    lines.append("GE %d" % (1 if case.ground == "pec" else 0))
     if case.ground == "pec":
-        lines.append("GN 1")
+        lines += ["GE 1", "GN 1"]
+    elif case.ground is not None:
+        lines += ["GE -1", "GN 2 0 0 0 %.6g %.6g" % case.ground]
+    else:
+        lines.append("GE 0")
 
     def seg_of(tag, where):
         w = case.wires[tag - 1]
@@ -141,6 +144,29 @@ def cases() -> list[Case]:
               W((0, 0.25, 10), (0, 0.25 + 0.24 * lam * math.cos(0.6), 10 - 0.24 * lam * math.sin(0.6)), 0.001, 20),
               W((0, -0.25, 10), (0, -0.25 - 0.24 * lam * math.cos(0.6), 10 - 0.24 * lam * math.sin(0.6)), 0.001, 20)],
              (1, "centre"), ground="pec", directions=[(0.0, 0.0), (45.0, 0.0), (45.0, 90.0)]),
+    ]
+    avg, poor, vgood = (13.0, 0.005), (5.0, 0.001), (20.0, 0.0303)
+    elev = [(80.0, 0.0), (60.0, 0.0), (30.0, 0.0), (0.0, 0.0)]  # 10, 30, 60, 90 deg elevation
+    f7 = 7.1e6
+    lam7 = C0 / f7
+    out += [
+        Case("real ground: 20 m dipole at 10 m, average soil", f,
+             [W((0, -0.24 * lam, 10), (0, 0.24 * lam, 10), 0.001, 40, True)], (1, "centre"),
+             ground=avg, directions=elev),
+        Case("real ground: 20 m dipole at 4 m, poor soil", f,
+             [W((0, -0.24 * lam, 4), (0, 0.24 * lam, 4), 0.001, 40, True)], (1, "centre"),
+             ground=poor, directions=elev),
+        Case("real ground: 40 m dipole at 6 m (0.14 lam), average soil", f7,
+             [W((0, -0.24 * lam7, 6), (0, 0.24 * lam7, 6), 0.001, 40, True)], (1, "centre"),
+             ground=avg, directions=elev),
+        Case("real ground: vertical half-wave, base 1 m up, average soil", f,
+             [W((0, 0, 1.0), (0, 0, 1.0 + 0.48 * lam), 0.005, 40, True)], (1, "centre"),
+             ground=avg, directions=[(85.0, 0.0), (75.0, 0.0), (60.0, 0.0), (45.0, 0.0)]),
+        Case("real ground: 3-el Yagi at 12 m, very good soil (fwd 15 deg / back)", f,
+             [W((0, -0.51 * lam / 2, 12), (0, 0.51 * lam / 2, 12), 0.006, 40, True),
+              W((0.2 * lam, -0.475 * lam / 2, 12), (0.2 * lam, 0.475 * lam / 2, 12), 0.006, 40, True),
+              W((0.35 * lam, -0.44 * lam / 2, 12), (0.35 * lam, 0.44 * lam / 2, 12), 0.006, 40, True)],
+             (2, "centre"), ground=vgood, directions=[(75.0, 0.0), (75.0, 180.0), (45.0, 0.0)]),
     ]
     # loading coil: series L that roughly resonates the quarter-wave dipole
     out[3].loads = [(1, dict(l=10e-6, r=1.0))]

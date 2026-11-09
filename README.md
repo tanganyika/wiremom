@@ -4,7 +4,8 @@ An open-source thin-wire **method-of-moments** antenna solver built on the
 **mixed-potential integral equation (MPIE)**, the formulation NEC-5 moved to. It
 is written from the published literature, not from NEC source code. It is meant
 to become the engine of an antenna-modelling app, so the core is a small,
-dependency-light library (NumPy only) with a plain Python API.
+dependency-light library (NumPy, plus SciPy for Bessel functions and splines)
+with a plain Python API.
 
 ## What it does today
 
@@ -16,14 +17,15 @@ dependency-light library (NumPy only) with a plain Python API.
 | Lumped series / parallel RLC loads (coils, traps), open circuits (insulators) | ✅ |
 | Skin-effect wire loss (conductivity per wire) | ✅ |
 | Free space, perfect ground plane (image theory, wires may touch ground) | ✅ |
+| Real (lossy) ground: full Sommerfeld solution, Fresnel far field, soil presets | ✅ |
 | Feed-point impedance, VSWR, frequency sweeps | ✅ |
 | Far-field gain (dBi), radiated power, efficiency | ✅ |
-| Real (lossy) ground: reflection-coefficient approximation, then Sommerfeld | ⬜ roadmap |
+| Wires buried in or connected to real ground (radials on the soil, ground rods) | ⬜ roadmap |
 | Near fields, current distribution export | ⬜ roadmap |
 | NEC-2 deck (`GW/GA/GH/GM/EX/LD/FR/GN/RP`) import and export | ⬜ roadmap |
 | Transmission-line and network elements (`TL`/`NT`) | ⬜ roadmap |
 | Surface patches and wire-to-patch junctions (the NEC-5 headline feature) | ⬜ roadmap |
-| Speed: symmetry, reuse of the frequency-independent geometry, native core | ⬜ roadmap |
+| Speed: frequency interpolation of the matrix, native core | ⬜ roadmap |
 
 ## How it works
 
@@ -48,6 +50,37 @@ dependency-light library (NumPy only) with a plain Python API.
    current at that node, so the feed impedance is `V / I_feed`.
 5. **Far field.** Integrate the currents (plus images) with the far-field phase
    factor, then `G = 4πU / P_in`.
+
+### Real ground
+
+The field reflected by a lossy half-space is written as Sommerfeld integrals.
+Each plane wave in the source's spectrum reflects with its own TE/TM Fresnel
+coefficient, and integrating over azimuth leaves J0/J1/J2 Bessel integrals over
+the radial wavenumber
+([ground.py](wiremom/ground.py) has the formulas). As in NEC-2:
+
+- The near-singular part, the quasi-static image scaled by
+  `Γ0 = (ε−1)/(ε+1)`, is taken out and handled by the same analytic image
+  integrals as the perfect ground.
+- The smooth remainder is tabulated per frequency on an (R, θ) grid and
+  interpolated with splines.
+- The integrals follow two raised arcs in the complex plane around the branch
+  points and the surface-wave pole. The tail then follows Hankel functions on
+  vertical paths, or the real axis when the source is nearly overhead.
+- Tables are stored in normalised (kR) form, so a sweep reuses one table within
+  ±2% of its frequency (`Model.ground_table_reuse`), at a cost of ~0.1% in
+  impedance.
+- The far field adds the image's field scaled by the Fresnel coefficients at
+  each elevation angle (the space wave). Efficiency therefore counts power
+  absorbed by the ground as lost.
+
+```python
+m = Model(st, ground="average")       # or "poor", "very good", "sea water", ...
+m = Model(st, ground=(15.0, 0.008))   # (relative permittivity, conductivity S/m)
+```
+
+Over real ground, wires must be above z = 0. Very low wires (a few cm) work,
+but buried or ground-connected wires don't yet.
 
 ## Usage
 
@@ -91,6 +124,18 @@ isolation, feeds at wire joints, and agreement with NEC-2.
 | trap dipole (parallel RLC, Q = 100) | 1.1 % | 0.01 dB |
 | 3-element Yagi (fwd/back) | 1.7 % | 0.09 dB |
 | inverted-V on PEC ground | 0.8 % | 0.00 dB |
+| 20 m dipole at 10 m, average soil (Sommerfeld) | 0.8 % | 0.01 dB |
+| 20 m dipole at 4 m, poor soil | 1.0 % | 0.00 dB |
+| 40 m dipole at 6 m (0.14 λ), average soil | 1.0 % | 0.00 dB |
+| vertical λ/2, base 1 m up, average soil | 1.7 % | 0.01 dB |
+| 3-element Yagi at 12 m, very good soil | 2.4 % | 0.24 dB (back lobe) |
+
+Over real ground the gains are compared at 10–90° elevation. Spot checks
+outside the harness also agree within about 2%: a dipole only 0.3 m above soil,
+a vertical with its base 0.1 m up, sea water, and very poor (city) ground.
+[tests/test_ground.py](tests/test_ground.py) also checks the Sommerfeld
+integrals against the closed-form image for a perfect conductor (to 1e-7) and
+the tables against direct integration for every soil preset.
 
 Resistance and gain agree closely. Most of the impedance difference is in the
 reactance, because NEC-2 drives a whole segment while wiremom drives a node. The
@@ -102,7 +147,7 @@ segments), while wiremom's barely changes.
 ## Development
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install numpy pytest
+python3 -m venv .venv && .venv/bin/pip install numpy scipy pytest
 .venv/bin/python -m pytest -q
 ```
 
@@ -117,5 +162,9 @@ python3 -m venv .venv && .venv/bin/pip install numpy pytest
   Trans. AP-24, 1976.
 - K. A. Michalski, J. R. Mosig, "Multilayered media Green's functions in
   integral equation formulations," IEEE Trans. AP-45, 1997 (real ground).
+- G. J. Burke, E. K. Miller, "Modeling antennas near to and penetrating a lossy
+  interface," IEEE Trans. AP-32, 1984 (NEC's Sommerfeld treatment).
+- W. C. Chew, *Waves and Fields in Inhomogeneous Media* (1990), ch. 2
+  (plane-wave expansion of the half-space dyadic Green's function).
 - G. J. Burke, A. J. Poggio, *NEC — Method of Moments* (NEC-2 manual, public
   domain), for the input-deck format.

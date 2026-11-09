@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import ground as gnd
 from .geometry import FALL, RISE, Structure
 from .integrals import gauss01, segment_integrals
 
@@ -69,9 +70,17 @@ class Model:
     structure: Structure
     sources: list[Source] = field(default_factory=list)
     loads: list[Load] = field(default_factory=list)
-    ground: str | None = None  # None = free space, "pec" = perfect ground plane at z = 0
+    # None = free space; "pec" = perfect ground plane at z = 0; real ground below
+    # z = 0 as a preset name ("average", "poor", "very good", "sea water", ...),
+    # (eps_r, sigma) or ground.RealGround
+    ground: object = None
     n_outer: int = 8
     n_inner: int = 8
+    n_ground: int = 6  # quadrature points per segment for the Sommerfeld remainder
+    # reuse a Sommerfeld table within this relative frequency distance (sweeps);
+    # 0 rebuilds the table at every frequency
+    ground_table_reuse: float = 0.02
+    _tables: list = field(default_factory=list, repr=False, compare=False)
 
     def add_source(self, tag: int, node: int, voltage: complex = 1.0) -> None:
         """Delta-gap voltage source at ``node`` (0..nseg) of wire ``tag``.
@@ -92,26 +101,46 @@ class Model:
         self.loads.append(Load(tag, node, r, l, c, parallel))
 
     # ------------------------------------------------------------------ solve
-    def impedance_matrix(self, freq: float) -> np.ndarray:
+    @property
+    def ground_model(self):
+        return gnd.make_ground(self.ground)
+
+    def impedance_matrix(self, freq: float, table=None) -> np.ndarray:
+        """Impedance matrix.  ``table`` overrides the Sommerfeld table (testing)."""
         st = self.structure
-        st.build(ground_plane=self.ground == "pec")
+        g = self.ground_model
+        st.build(ground_plane=g == "pec")
         omega = 2 * np.pi * freq
         k = omega / C0
 
         S, T = segment_integrals(st.p0, st.t, st.length, st.radius, k, self.n_outer, self.n_inner)
         tt = st.t @ st.t.T
-        if self.ground == "pec":
+        # image scale: 1 for PEC; Gamma0 = (eps-1)/(eps+1) for real ground, whose
+        # remaining reflected field comes from the Sommerfeld table below
+        img = 0.0
+        if g == "pec":
             if np.any(np.minimum(st.p0[:, 2], st.p1[:, 2]) < -1e-9):
                 raise ValueError("with a ground plane, all wires must be at z >= 0")
+            img = 1.0
+        elif g is not None:
+            if np.minimum(st.p0[:, 2], st.p1[:, 2]).min() <= 0:
+                raise ValueError("over real ground all wires must be above z = 0 (buried or "
+                                 "ground-connected wires are not supported yet; use radials "
+                                 "a little above the ground, or ground='pec')")
+            img = 0.0 if table is not None else g.gamma0(freq)
+        if g is not None:
             # image of a current element: horizontal part reversed, charge reversed.
             # = reflected segment carrying the negated current.
             Si, Ti = segment_integrals(st.p0, st.t, st.length, st.radius, k, self.n_outer,
                                        self.n_inner, src_p0=st.p0 * REFLECT, src_t=st.t * REFLECT)
-            S = S - Si
-            T_img = Ti
+            S = S - img * Si
+            T_img = img * Ti
             tt_img = st.t @ (st.t * REFLECT).T
-        elif self.ground is not None:
-            raise ValueError(f"unknown ground {self.ground!r}")
+        K = None
+        if isinstance(g, gnd.RealGround):
+            if table is None:
+                table = self._sommerfeld_table(g, freq)
+            K = gnd.segment_integrals(table, st.p0, st.t, st.length, self.n_ground, freq=freq)
 
         # (M, 2) half arrays; a single-half (ground) basis is padded with a null half
         halves = [b.halves if len(b.halves) == 2 else (b.halves[0], None) for b in st.basis]
@@ -129,10 +158,13 @@ class Model:
                 sp, sq = seg[:, a][:, None], seg[:, b][None, :]
                 cap = cc[:, a][:, None] * cc[:, b][None, :]
                 vec = T[sp, sq, shp[:, a][:, None], shp[:, b][None, :]] * tt[sp, sq]
-                if self.ground == "pec":
+                if g is not None:
                     vec = vec - T_img[sp, sq, shp[:, a][:, None], shp[:, b][None, :]] * tt_img[sp, sq]
                 Z += jwmu * cap * vec
                 Z += inv_jweps * dv[:, a][:, None] * dv[:, b][None, :] * S[sp, sq]
+                if K is not None:
+                    # reflected field E = D . J tested with the basis: Z = -<t, E>
+                    Z -= cap * K[sp, sq, shp[:, a][:, None], shp[:, b][None, :]]
 
         # skin-effect loss: R' = Rs / (2 pi a), Rs = sqrt(w mu / 2 sigma), times the
         # Gram integral of two linear shapes on the same segment (L/3 or L/6)
@@ -164,6 +196,21 @@ class Model:
         for m in opens:
             Z[m, m] = big
         return Z
+
+    def _sommerfeld_table(self, g, freq: float):
+        st = self.structure
+        r_min, r_max = gnd.table_range(st.p0, st.t, st.length, self.n_ground)
+        best = None
+        for tab in self._tables:
+            if tab.covers(g, freq, r_min, r_max, self.ground_table_reuse):
+                if best is None or abs(tab.freq - freq) < abs(best.freq - freq):
+                    best = tab
+        if best is not None:
+            return best
+        margin = 1.0 + 2 * self.ground_table_reuse
+        tab = gnd.SommerfeldTable(g, freq, r_min, r_max, margin=margin)
+        self._tables = (self._tables + [tab])[-16:]
+        return tab
 
     def solve(self, freq: float) -> "Solution":
         if not self.sources:
@@ -223,8 +270,9 @@ class Solution:
                 A[h.seg, h.shape] += h.c * coef
         return A
 
-    def radiation_vector(self, theta, phi, n_quad: int = 6):
-        """Radiation vector N(theta, phi) = int J exp(jk r_hat . r') dl' (cartesian, A m)."""
+    def radiation_vector(self, theta, phi, n_quad: int = 6, image: bool = False):
+        """Radiation vector N(theta, phi) = int J exp(jk r_hat . r') dl' (cartesian, A m)
+        of the currents, or with ``image`` of their PEC image (current -P J at P r')."""
         st = self.model.structure
         theta = np.atleast_1d(np.asarray(theta, float))
         phi = np.atleast_1d(np.asarray(phi, float))
@@ -232,29 +280,40 @@ class Solution:
                          np.cos(theta)], axis=-1)                       # (D, 3)
         x, w = gauss01(n_quad)
         A = self._segment_amplitudes()
-        images = [(1.0, np.ones(3))]
-        if self.model.ground == "pec":
-            images.append((-1.0, REFLECT))
-        Nvec = np.zeros(rhat.shape, complex)
-        for sign, refl in images:
-            p0, tv = st.p0 * refl, st.t * refl
-            pts = p0[:, None, :] + (x[None, :, None] * st.length[:, None, None]) * tv[:, None, :]
-            amp = A[:, RISE, None] * x[None, :] + A[:, FALL, None] * (1 - x[None, :])  # (N, q)
-            phase = np.exp(1j * self.k * np.einsum("dk,nqk->dnq", rhat, pts))
-            s = np.einsum("dnq,nq,q,n->dn", phase, amp, w, st.length)           # (D, N)
-            Nvec += sign * s @ tv
-        return Nvec, theta, phi
+        sign, refl = (-1.0, REFLECT) if image else (1.0, np.ones(3))
+        p0, tv = st.p0 * refl, st.t * refl
+        pts = p0[:, None, :] + (x[None, :, None] * st.length[:, None, None]) * tv[:, None, :]
+        amp = A[:, RISE, None] * x[None, :] + A[:, FALL, None] * (1 - x[None, :])  # (N, q)
+        phase = np.exp(1j * self.k * np.einsum("dk,nqk->dnq", rhat, pts))
+        s = np.einsum("dnq,nq,q,n->dn", phase, amp, w, st.length)           # (D, N)
+        return sign * s @ tv, theta, phi
 
     def radiation_intensity(self, theta, phi):
-        """U(theta, phi) in W/sr, returned with E_theta, E_phi factors (r e^{jkr} E)."""
-        Nvec, th, ph = self.radiation_vector(theta, phi)
+        """U(theta, phi) in W/sr, with the far-field factors E_theta, E_phi (r e^{jkr} E).
+
+        Over ground the reflected wave is the PEC image's field scaled by the plane-wave
+        reflection coefficients at that elevation: gTM for E_theta, -gTE for E_phi
+        (both 1 for a perfect ground).  This is the space wave only; the surface wave,
+        which vanishes in the far field, is not included."""
+        th = np.atleast_1d(np.asarray(theta, float))
+        ph = np.atleast_1d(np.asarray(phi, float))
         th_hat = np.stack([np.cos(th) * np.cos(ph), np.cos(th) * np.sin(ph), -np.sin(th)], -1)
         ph_hat = np.stack([-np.sin(ph), np.cos(ph), np.zeros_like(ph)], -1)
         pref = -1j * self.omega * MU0 / (4 * np.pi)
-        e_th = pref * np.einsum("dk,dk->d", Nvec, th_hat)
-        e_ph = pref * np.einsum("dk,dk->d", Nvec, ph_hat)
+        N, _, _ = self.radiation_vector(th, ph)
+        e_th = pref * np.einsum("dk,dk->d", N, th_hat)
+        e_ph = pref * np.einsum("dk,dk->d", N, ph_hat)
+        g = self.model.ground_model
+        if g is not None:
+            Ni, _, _ = self.radiation_vector(th, ph, image=True)
+            r_th, r_ph = (1.0, 1.0)
+            if isinstance(g, gnd.RealGround):
+                g_te, g_tm = g.reflection(self.freq, np.minimum(th, np.pi / 2))
+                r_th, r_ph = g_tm, -g_te
+            e_th = e_th + r_th * pref * np.einsum("dk,dk->d", Ni, th_hat)
+            e_ph = e_ph + r_ph * pref * np.einsum("dk,dk->d", Ni, ph_hat)
         U = (np.abs(e_th) ** 2 + np.abs(e_ph) ** 2) / (2 * ETA0)
-        if self.model.ground is not None:
+        if g is not None:
             U = np.where(th > np.pi / 2 + 1e-12, 0.0, U)
         return U, e_th, e_ph
 
@@ -267,7 +326,7 @@ class Solution:
         return 10 * np.log10(np.maximum(self.gain(theta, phi), 1e-30))
 
     def radiated_power(self, n_theta: int = 91, n_phi: int = 72) -> float:
-        th_max = np.pi / 2 if self.model.ground is not None else np.pi
+        th_max = np.pi / 2 if self.model.ground_model is not None else np.pi
         xt, wt = gauss01(n_theta)
         th = xt * th_max
         ph = np.arange(n_phi) * 2 * np.pi / n_phi
@@ -278,4 +337,6 @@ class Solution:
 
     @property
     def efficiency(self) -> float:
+        """Radiated (space-wave) power / input power.  Over real ground this also
+        counts power absorbed by the ground as lost."""
         return self.radiated_power() / self.input_power
