@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+tools/scratch/
+.pytest_cache/
