@@ -2,8 +2,7 @@
 //! A 3-element 20 m Yagi (about 70 segments) in free space and 15 m over average
 //! ground: matrix fill + solve, a pattern scan like an application's (about 8,000
 //! directions) and a 24-point sweep; then a vertical with a ground rod and eight
-//! buried radials (whose air-to-ground couplings are computed directly, the slow
-//! part).
+//! buried radials.
 
 use num_complex::Complex64 as C;
 use std::time::Instant;

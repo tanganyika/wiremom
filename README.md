@@ -99,7 +99,7 @@ this wire and the junction.
    |---|---|
    | air–air | free space + Γ0 image + tabulated remainder (as above) |
    | ground–ground | free space with the ground's complex wavenumber k√ε and permittivity, a −Γ0 image, and a remainder table built from inside the ground |
-   | air–ground | the field transmitted through the surface. Its quasi-static part — the free field with the charge term scaled by 2/(1+ε) — is integrated analytically; the remainder is evaluated directly as a Sommerfeld integral |
+   | air–ground | the field transmitted through the surface. Its quasi-static part — the free field with the charge term scaled by 2/(1+ε) — is integrated analytically; the remainder is interpolated from a 3-D table over (ρ, source height, observer depth). Each table row shares one set of Bessel evaluations across all heights and depths |
 
    Buried currents radiate into the air through the Fresnel transmission
    coefficients, found by reciprocity. A wire that ends on the surface from
@@ -152,7 +152,13 @@ this wire and the junction.
   - two 2 m ground rods at 10 kHz: 89.2 Ω, against 89.8 Ω from Dwight's
     formula;
   - the matrix stays symmetric (1.8e-5) with wires on both sides;
-  - buried radials: more radials raise a vertical's efficiency.
+  - buried radials: more radials raise a vertical's efficiency;
+  - the ground-side and air-to-ground tables match direct Sommerfeld
+    integration (to under 2% and 0.5% point by point, out to grazing angles in
+    sea water), and tabulated couplings change a radial system's impedance by
+    about 1e-6 (`--example crosscheck`);
+  - a quarter-wave vertical over 16 radials in sea water gives 38 Ω at 86%
+    efficiency.
 - **Surfaces:**
   - the analytic triangle integrals match brute force and a closed form;
   - a lossless dipole or monopole with a plate radiates exactly its input power;
@@ -195,6 +201,9 @@ the reference cases ever need to change.
 | Free space | 2 ms | 12 ms | 12 ms |
 | 15 m over average ground | 25 ms | 29 ms | 230 ms |
 
+A vertical with a ground rod and 8 buried radials (about 120 segments) solves in
+70 ms. With the air-to-ground couplings integrated directly it took 750 ms.
+
 What keeps it fast:
 
 - **Adaptive quadrature:** distant segment pairs get fewer Gauss points. The
@@ -203,6 +212,9 @@ What keeps it fast:
   more for longer ones.
 - **Ground tables limited to the geometry:** they cover only the distances and
   angles the antenna produces.
+- **Tabulated air-to-ground couplings** for buried wires: one table row per
+  horizontal distance, with its Bessel functions shared across all heights and
+  depths.
 - **Blended tables in sweeps:** a sweep builds tables at frequency buckets 4%
   apart and blends the two around each frequency (error under ~5e-5). A single
   solve builds one exact table.
@@ -234,9 +246,9 @@ These are the weaker spots, with how far they have been checked.
   (other than as flat triangles), and NEC deck import/export (the application
   using this crate does that).
 - **Speed:**
-  - air-to-ground couplings of buried wires are computed directly (about 0.8 s
-    per frequency for a vertical with 8 buried radials); tabulating them would
-    help;
+  - buried-wire tables are rebuilt for every frequency of a sweep (not
+    blended), and strongly conducting grounds such as sea water need finer
+    tables (about 0.3 s for 16 radials);
   - the matrix is dense, so memory grows as N² and the solve as N³ (about 2,000
     unknowns take a few seconds);
   - no frequency interpolation of the matrix yet.

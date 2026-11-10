@@ -28,7 +28,7 @@
 
 use crate::mesh::Mesh;
 use crate::quad::{composite, gauss01};
-use crate::spline::Spline2;
+use crate::spline::{Spline2, Spline3};
 use crate::vec3::*;
 use crate::{C0, EPS0, Error, MU0};
 use complex_bessel::{Scaling, besselj_seq, hankel1_seq, hankel2_seq};
@@ -300,7 +300,7 @@ pub struct Table {
     pub gamma0: C,
     pub side: Side,
     fixed: bool,
-    /// wavenumber of the table's medium / k (1, or sqrt(eps) in the ground)
+    /// wavenumber in the ground / k, for the ground side's phase reference
     n_self: C,
     x: Vec<f64>,
     splines: Vec<Spline2>,
@@ -328,7 +328,7 @@ impl Table {
         let r_min = (r_min / margin).max(1e-6 * lam);
         let r_max = (r_max * margin).max(2.0 * r_min);
         let n2 = eps.sqrt();
-        let n_self = if side == Side::Ground { n2 } else { C::new(1.0, 0.0) };
+        let n_self = n2;
         // geometric to lam/4, then ~lam/30 (finer for low-loss water: lateral wave;
         // in the ground, on the scale of the ground wavelength or skin depth)
         let fine = if side == Side::Ground {
@@ -370,13 +370,26 @@ impl Table {
                 let rho = rr * th.cos();
                 let h = (rr * th.sin()).max(1e-9 * lam);
                 let d = reflected_dyadic_side(rho, h, freq, eps, &co, side);
-                let norm = (J * n_self * k * rr).exp() * rr / (omega * k);
+                let norm = (J * Self::phase(side, n_self, k, rho, h)).exp() * rr / (omega * k);
                 d.map(|v| v * norm)
             })
             .collect();
         let x: Vec<f64> = rs.iter().map(|r| k * r).collect();
         let splines = (0..5).map(|c| Spline2::new(x.clone(), ts.clone(), vals.iter().map(|v| v[c]).collect())).collect();
         Table { ground, freq, k, gamma0, side, fixed: fixed.is_some(), n_self, x, splines }
+    }
+
+    /// Phase reference divided out of the stored values.  In the air, the image
+    /// path kR.  In the ground, the lateral wave: k rho sideways, and k2 h (with its
+    /// attenuation) for the depth, which every wave there shares.  (Using k2 R
+    /// instead treated the lateral wave as if it decayed along the surface too, and
+    /// multiplied the stored values by up to e^400 in sea water.)
+    #[inline]
+    fn phase(side: Side, n_self: C, k: f64, rho: f64, h: f64) -> C {
+        match side {
+            Side::Air => C::new(k * (rho * rho + h * h).sqrt(), 0.0),
+            Side::Ground => k * (rho + n_self * h),
+        }
     }
 
     pub fn covers(&self, ground: &RealGround, freq: f64, r_min: f64, r_max: f64) -> bool {
@@ -391,7 +404,7 @@ impl Table {
         let k = omega / C0;
         let r = (rho * rho + h * h).sqrt();
         let th = h.atan2(rho);
-        let back = (-J * self.n_self * k * r).exp() * (omega * k / r);
+        let back = (-J * Self::phase(self.side, self.n_self, k, rho, h)).exp() * (omega * k / r);
         let x = k * r;
         [0, 1, 2, 3, 4].map(|c| self.splines[c].eval(x, th) * back)
     }
@@ -637,10 +650,199 @@ pub fn seg_tri_remainder(table: &dyn Eval, freq: f64, p0: V3, t: V3, len: f64, n
     k
 }
 
+/// Transmitted remainder (as `transmitted_dyadic(.., true)`) at one `rho` for every
+/// (zs[j], d[l]) at once: `out[j * d.len() + l]`.  The Bessel functions depend only
+/// on rho, so they are shared; the heights enter through cheap exponentials.
+pub fn transmitted_batch(rho: f64, zs: &[f64], d: &[f64], freq: f64, eps: C) -> Vec<[C; 5]> {
+    let omega = 2.0 * PI * freq;
+    let k = omega / C0;
+    let k1s = C::new(k * k, 0.0);
+    let k2 = eps.sqrt() * k;
+    let n = eps.sqrt();
+    let c = 2.0 / (1.0 + eps);
+    let (nz, nd) = (zs.len(), d.len());
+    let mut out = vec![[C::new(0.0, 0.0); 5]; nz * nd];
+    // combinations with h = zs + d below rho take the Hankel tail, the rest the real
+    // axis; each group's spectral rule is the one for its smallest h
+    for hankel in [true, false] {
+        let in_group = |j: usize, l: usize| ((zs[j] + d[l]) < rho) == hankel;
+        let h_min = (0..nz).flat_map(|j| (0..nd).map(move |l| (j, l))).filter(|&(j, l)| in_group(j, l)).map(|(j, l)| zs[j] + d[l]).fold(f64::INFINITY, f64::min);
+        if !h_min.is_finite() {
+            continue;
+        }
+        let mut pts = Vec::new();
+        nodes(rho, h_min.max(1e-12), k, Some(k2), &mut pts);
+        let mut e1 = vec![C::new(0.0, 0.0); nz];
+        let mut u = vec![[C::new(0.0, 0.0); 5]; nd];
+        for (kind, kr, w) in pts {
+            let kz1 = kz(kr, k1s);
+            let kz2 = kz(kr, eps * k1s);
+            let t_te = 2.0 * kz1 / (kz1 + kz2);
+            let tm = 2.0 * n * kz1 / (eps * kz1 + kz2) / (k1s * n);
+            let x = kr * rho;
+            let (b0, b1) = bessel01(kind, x);
+            let b2 = if x.norm() > 1e-12 { 2.0 * b1 / x - b0 } else { C::new(0.0, 0.0) };
+            let tt = [
+                t_te * (b0 + b2) + tm * kz1 * kz2 * (b0 - b2),
+                t_te * (b0 - b2) + tm * kz1 * kz2 * (b0 + b2),
+                tm * kz2 * kr * (-2.0 * J) * b1,
+                tm * kr * kz1 * (-2.0 * J) * b1,
+                tm * kr * kr * 2.0 * b0,
+            ];
+            let q = kz1 * kz1 / k1s;
+            let a = 2.0 * b0 * (1.0 - c);
+            let g = [
+                a + c * ((b0 + b2) + q * (b0 - b2)),
+                a + c * ((b0 - b2) + q * (b0 + b2)),
+                c * (kz1 * kr / k1s * (-2.0 * J) * b1),
+                c * (kz1 * kr / k1s * (-2.0 * J) * b1),
+                a + c * (kr * kr / k1s * 2.0 * b0),
+            ];
+            let w0 = kr / kz1 * w;
+            for (l, ul) in u.iter_mut().enumerate() {
+                let e2 = (-J * kz2 * d[l]).exp() * w0;
+                let e3 = (-J * kz1 * d[l]).exp() * w0;
+                *ul = [0, 1, 2, 3, 4].map(|i| tt[i] * e2 - g[i] * e3);
+            }
+            for (j, e) in e1.iter_mut().enumerate() {
+                *e = (-J * kz1 * zs[j]).exp();
+            }
+            for j in 0..nz {
+                let ej = e1[j];
+                if ej.norm_sqr() < 1e-300 {
+                    continue;
+                }
+                for l in 0..nd {
+                    if !in_group(j, l) {
+                        continue;
+                    }
+                    let o = &mut out[j * nd + l];
+                    let ul = &u[l];
+                    for i in 0..5 {
+                        o[i] += ej * ul[i];
+                    }
+                }
+            }
+        }
+    }
+    let pref = -omega * MU0 / (8.0 * PI);
+    for o in out.iter_mut() {
+        *o = o.map(|v| v * pref);
+    }
+    out
+}
+
+/// Grid from `lo` to `hi`: geometric (ratio about 1.3) up to `near`, then steps of
+/// `step`; at least 4 points.
+fn axis(lo: f64, hi: f64, near: f64, step: f64) -> Vec<f64> {
+    let hi = hi.max(lo * 1.5);
+    let near = near.clamp(lo, hi);
+    let mut v = vec![lo];
+    if near > lo {
+        let n = ((near / lo).ln() / 1.3f64.ln()).ceil().max(1.0) as usize;
+        for i in 1..=n {
+            v.push(lo * (near / lo).powf(i as f64 / n as f64));
+        }
+    }
+    let mut x = *v.last().unwrap();
+    while x < hi {
+        x = (x + step).min(hi);
+        v.push(x);
+    }
+    if v.len() < 4 {
+        v = (0..4).map(|i| lo + (hi - lo) * i as f64 / 3.0).collect();
+    }
+    v
+}
+
+/// Table of the transmitted remainder over (rho, zs, d) for one frequency, built
+/// row by row in rho with [`transmitted_batch`].  Stored normalised by the air and
+/// ground phases and the distance, which leaves a smooth function to interpolate.
+pub struct TransTable {
+    freq: f64,
+    k: f64,
+    k2: C,
+    spline: Spline3,
+}
+
+impl TransTable {
+    /// Covering horizontal offsets up to `rho_max`, source heights in
+    /// [zs_min, zs_max] and observer depths in [d_min, d_max].
+    pub fn new(eps: C, freq: f64, rho_max: f64, zs: (f64, f64), d: (f64, f64)) -> TransTable {
+        let k = 2.0 * PI * freq / C0;
+        let k2 = eps.sqrt() * k;
+        let lam = 2.0 * PI / k;
+        let step = lam / 30.0;
+        let lam2 = 2.0 * PI / k2.norm();
+        let step_d = (lam2 / 30.0).min(0.25 / k2.im.abs().max(1e-30));
+        let zs_ax = axis(zs.0 / 1.2, zs.1 * 1.05 + 1e-9, lam / 4.0, step);
+        let d_ax = axis(d.0 / 1.2, d.1 * 1.05 + 1e-9, lam2 / 4.0, step_d);
+        // rho: 0, then geometric from a quarter of the smallest height sum
+        let h_min = zs_ax[0] + d_ax[0];
+        let mut rho_ax = vec![0.0];
+        rho_ax.extend(axis(0.25 * h_min, (rho_max * 1.05).max(h_min), lam / 4.0, step));
+        let (nz, nd) = (zs_ax.len(), d_ax.len());
+        let rows: Vec<Vec<[C; 5]>> = rho_ax
+            .par_iter()
+            .map(|&rho| {
+                let v = transmitted_batch(rho, &zs_ax, &d_ax, freq, eps);
+                let mut out = v;
+                for j in 0..nz {
+                    for l in 0..nd {
+                        let nrm = Self::norm(k, k2, rho, zs_ax[j], d_ax[l]);
+                        out[j * nd + l] = out[j * nd + l].map(|x| x / nrm);
+                    }
+                }
+                out
+            })
+            .collect();
+        let vals: Vec<C> = rows.into_iter().flatten().flatten().collect();
+        TransTable { freq, k, k2, spline: Spline3::new(rho_ax, zs_ax, d_ax, 5, &vals) }
+    }
+
+    #[inline]
+    fn norm(k: f64, k2: C, rho: f64, zs: f64, d: f64) -> C {
+        let r_air = (rho * rho + zs * zs).sqrt();
+        let r = (rho * rho + (zs + d) * (zs + d)).sqrt();
+        (-J * (k * r_air + k2 * d)).exp() / r
+    }
+
+    /// Remainder components at (rho, zs, d); for the table's own frequency.
+    pub fn eval(&self, rho: f64, zs: f64, d: f64) -> [C; 5] {
+        let mut out = [C::new(0.0, 0.0); 5];
+        self.spline.eval(rho, zs, d, &mut out);
+        let nrm = Self::norm(self.k, self.k2, rho, zs, d);
+        out.map(|v| v * nrm)
+    }
+
+    pub fn freq(&self) -> f64 {
+        self.freq
+    }
+}
+
 /// Galerkin integrals of the transmitted remainder: `K[i*na + j]` for test segment
 /// below[i] (in the ground) and source segment above[j] (in the air).  Evaluated
 /// directly (no table): 6 Gauss points per segment for nearby pairs, 2 otherwise.
 pub fn cross_integrals(m: &Mesh, freq: f64, eps: C, below: &[usize], above: &[usize]) -> Vec<[[C; 2]; 2]> {
+    cross_integrals_with(m, freq, eps, below, above, false)
+}
+
+/// As [`cross_integrals`]; with `tabulate` the field comes from a [`TransTable`]
+/// built for these segments (much faster for more than a few pairs).
+pub fn cross_integrals_with(m: &Mesh, freq: f64, eps: C, below: &[usize], above: &[usize], tabulate: bool) -> Vec<[[C; 2]; 2]> {
+    let table = tabulate.then(|| {
+        let pb: Vec<V3> = quad_points(m, 6, below).into_iter().flatten().collect();
+        let pa: Vec<V3> = quad_points(m, 6, above).into_iter().flatten().collect();
+        let range = |p: &[V3], f: fn(&V3) -> f64| p.iter().map(f).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+        let zs = range(&pa, |p| p[2]);
+        let d = range(&pb, |p| -p[2]);
+        let span = |i: usize| {
+            let all = pa.iter().chain(&pb).map(|p| p[i]);
+            let (lo, hi) = all.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+            hi - lo
+        };
+        TransTable::new(eps, freq, span(0).hypot(span(1)), zs, d)
+    });
     let mid = |s: usize| along(m.p0[s], m.t[s], 0.5 * m.len[s]);
     let pts6b = quad_points(m, 6, below);
     let pts6a = quad_points(m, 6, above);
@@ -650,11 +852,14 @@ pub fn cross_integrals(m: &Mesh, freq: f64, eps: C, below: &[usize], above: &[us
         .par_iter()
         .enumerate()
         .flat_map_iter(|(i, &p)| {
-            let (pts6b, pts6a, pts2b, pts2a) = (&pts6b, &pts6a, &pts2b, &pts2a);
+            let (pts6b, pts6a, pts2b, pts2a, table) = (&pts6b, &pts6a, &pts2b, &pts2a, &table);
             above.iter().enumerate().map(move |(j, &q)| {
                 let near = norm(sub(mid(p), mid(q))) < 3.0 * (m.len[p] + m.len[q]);
                 let (pp, pq, nq) = if near { (&pts6b[i], &pts6a[j], 6) } else { (&pts2b[i], &pts2a[j], 2) };
-                galerkin(m, p, q, pp, pq, nq, |r, s, rho| transmitted_dyadic(rho, s[2], -r[2], freq, eps, true))
+                match table {
+                    Some(t) => galerkin(m, p, q, pp, pq, nq, |r, s, rho| t.eval(rho, s[2], -r[2])),
+                    None => galerkin(m, p, q, pp, pq, nq, |r, s, rho| transmitted_dyadic(rho, s[2], -r[2], freq, eps, true)),
+                }
             })
         })
         .collect()

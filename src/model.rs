@@ -297,6 +297,9 @@ pub struct Model {
     /// it for every frequency.  The two tables around each frequency are blended,
     /// so 0.04 (the default) costs under ~5e-5 in impedance.
     pub ground_table_reuse: f64,
+    /// Interpolate the air-to-ground couplings of buried wires from a table
+    /// (default) instead of integrating each one directly (slow; for checking).
+    pub tabulate_cross: bool,
     pub tables: TableCache,
     /// Transmission lines and other two-ports between gaps.
     pub networks: Vec<TwoPort>,
@@ -317,6 +320,7 @@ impl Model {
             adaptive: true,
             merge_tol: None,
             ground_table_reuse: 0.04,
+            tabulate_cross: true,
             tables: TableCache::default(),
             networks: vec![],
             surfaces: vec![],
@@ -407,7 +411,7 @@ impl Model {
                     let t = self.tables.get(g, Side::Ground, freq, win, self.ground_table_reuse);
                     k_gnd = Some(sommerfeld::segment_integrals_of(&*t, m, self.n_ground, freq, &gnd));
                     if !air.is_empty() {
-                        k_cross = Some(sommerfeld::cross_integrals(m, freq, eps, &gnd, &air));
+                        k_cross = Some(sommerfeld::cross_integrals_with(m, freq, eps, &gnd, &air, self.tabulate_cross));
                     }
                 }
             }

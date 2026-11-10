@@ -188,3 +188,71 @@ fn more_buried_radials_raise_efficiency() {
     assert!(e16 > e4, "{e4} {e16}");
     assert!(e4 > 0.05 && e16 < 0.9);
 }
+
+#[test]
+fn ground_side_table_matches_direct_integration() {
+    // the ground-side reflection table against direct integration, out to grazing
+    // angles, for grounds from poor to sea water (sea water used to blow up: the
+    // table divided the lateral wave by the ground's attenuation along R)
+    use wiremom::sommerfeld::{Table, Window};
+    for (f, g) in [(28e6, RealGround::POOR), (7.1e6, RealGround::AVERAGE), (1.9e6, RealGround::VERY_GOOD), (3.6e6, RealGround::SEA_WATER)] {
+        let eps = g.eps_c(f);
+        let g0 = g.gamma0(f);
+        let co = Coeffs { shift: (-g0, g0), fixed: None };
+        let t = Table::new_window(g, f, Window { r_min: 0.05, r_max: 45.0, theta_min: 0.001 }, 1.05, None, Side::Ground);
+        let peak = reflected_dyadic_side(0.05, 0.2, f, eps, &co, Side::Ground).iter().map(|v| v.norm()).fold(0.0, f64::max);
+        for (rho, h) in [(0.1, 0.6), (1.0, 0.6), (3.0, 0.2), (10.0, 0.6), (16.0, 1.5), (30.0, 0.6), (40.0, 0.1)] {
+            let want = reflected_dyadic_side(rho, h, f, eps, &co, Side::Ground);
+            let got = t.eval(rho, h, f);
+            let scale = want.iter().map(|v| v.norm()).fold(0.0, f64::max);
+            let err = got.iter().zip(&want).map(|(a, b)| (a - b).norm()).fold(0.0, f64::max);
+            assert!(err < 0.02 * scale + 1e-9 * peak, "{g:?} rho {rho} h {h}: {got:?} vs {want:?}");
+        }
+    }
+}
+
+#[test]
+fn transmission_table_matches_direct_integration() {
+    use wiremom::sommerfeld::TransTable;
+    for (f, g) in [(28e6, RealGround::POOR), (7.1e6, RealGround::AVERAGE), (3.6e6, RealGround::SEA_WATER)] {
+        let lam = C0 / f;
+        let eps = g.eps_c(f);
+        let t = TransTable::new(eps, f, 0.35 * lam, (0.008, 0.22 * lam), (0.004, 1.0));
+        let mut worst = 0.0f64;
+        for i in 0..200 {
+            let u = |p: usize| ((i * p) % 199) as f64 / 199.0;
+            let (rho, zs, d) = (0.34 * lam * u(37).powi(3), 0.009 + 0.21 * lam * u(53).powi(3), 0.0045 + 0.99 * u(71).powi(2));
+            let want = transmitted_dyadic(rho, zs, d, f, eps, true);
+            let got = t.eval(rho, zs, d);
+            let scale = want.iter().map(|v| v.norm()).fold(0.0, f64::max);
+            worst = worst.max(got.iter().zip(&want).map(|(a, b)| (a - b).norm()).fold(0.0, f64::max) / scale);
+        }
+        println!("{g:?}: worst relative error {worst:.1e}");
+        assert!(worst < 5e-3, "{g:?}: {worst}");
+    }
+}
+
+#[test]
+fn tabulated_air_to_ground_couplings_match_direct() {
+    // vertical with a rod and buried radials, in average ground and in sea water
+    for (f, g, depth) in [(7.1e6, RealGround::AVERAGE, 0.1), (3.6e6, RealGround::SEA_WATER, 0.3)] {
+        let lam = C0 / f;
+        let mut w = vec![Wire::new([0.0, 0.0, -1.0], [0.0, 0.0, 0.24 * lam], 0.005, 26)];
+        for i in 0..6 {
+            let a = 2.0 * PI * i as f64 / 6.0;
+            w.push(Wire::new([0.0, 0.0, -depth], [0.2 * lam * a.cos(), 0.2 * lam * a.sin(), -depth], 0.002, 8));
+        }
+        let mut m = Model::new(w, Ground::Real(g));
+        m.add_source(0, 3, ONE);
+        let st = m.solve(f).unwrap();
+        m.tabulate_cross = false;
+        let sd = m.solve(f).unwrap();
+        let (zt, zd) = (st.input_impedance(), sd.input_impedance());
+        println!("{g:?}: table {zt:.4}, direct {zd:.4}, efficiency {:.3}", st.efficiency());
+        assert!((zt - zd).norm() < 1e-5 * zd.norm(), "{zt} vs {zd}");
+        // a quarter-wave vertical fed against radials in the sea: low loss, ~36 ohm
+        if g == RealGround::SEA_WATER {
+            assert!(st.efficiency() > 0.8 && (zt.re - 37.0).abs() < 6.0, "{zt}");
+        }
+    }
+}
