@@ -96,11 +96,32 @@ pub struct Mesh {
     pub nodes: Vec<V3>,
     pub basis: Vec<Basis>,
     pub ground_plane: bool,
+    /// Medium of each segment: AIR (z > 0) or GROUND (z < 0).  Without an
+    /// interface (free space, perfect ground) every segment is AIR.
+    pub medium: Vec<u8>,
+    /// Notes about the geometry (e.g. wire ends left unconnected at ground level).
+    pub warnings: Vec<String>,
+}
+
+pub const AIR: u8 = 0;
+pub const GROUND: u8 = 1;
+
+/// How the ground surface z = 0 is treated while meshing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Surface {
+    /// No interface: free space.
+    None,
+    /// Perfect ground plane: wires must be at z >= 0; ends on it connect to it.
+    Perfect,
+    /// Lossy ground: wires may be on either side; a wire crossing z = 0 is cut there,
+    /// and every segment lies wholly in one medium.
+    Interface,
 }
 
 /// Build the mesh.  `merge_tol` (m) joins segment ends; `None` uses the same rule as
 /// most wire codes: 1e-4 of the shortest segment, at least 1e-7 m.
-pub fn build(wires: &[Wire], ground_plane: bool, merge_tol: Option<f64>) -> Result<Mesh, Error> {
+pub fn build(wires: &[Wire], surface: Surface, merge_tol: Option<f64>) -> Result<Mesh, Error> {
+    let ground_plane = surface == Surface::Perfect;
     let mut m = Mesh {
         p0: vec![],
         p1: vec![],
@@ -113,6 +134,8 @@ pub fn build(wires: &[Wire], ground_plane: bool, merge_tol: Option<f64>) -> Resu
         nodes: vec![],
         basis: vec![],
         ground_plane,
+        medium: vec![],
+        warnings: vec![],
     };
     for (wi, w) in wires.iter().enumerate() {
         let total = w.length();
@@ -137,6 +160,10 @@ pub fn build(wires: &[Wire], ground_plane: bool, merge_tol: Option<f64>) -> Resu
                 l.iter().map(|x| x / s).collect()
             }
         };
+        let mut fracs = fracs;
+        if surface == Surface::Interface && w.start[2] * w.end[2] < 0.0 {
+            fracs = put_node_at(fracs, w.start[2] / (w.start[2] - w.end[2]), matches!(w.segments, Segments::Uniform(_)));
+        }
         let dir = scale(sub(w.end, w.start), 1.0 / total);
         let mut segs = vec![];
         let mut acc = 0.0;
@@ -154,6 +181,9 @@ pub fn build(wires: &[Wire], ground_plane: bool, merge_tol: Option<f64>) -> Resu
         }
         m.wire_segs.push(segs);
     }
+    m.medium = (0..m.p0.len())
+        .map(|s| if surface == Surface::Interface && m.p0[s][2] + m.p1[s][2] < 0.0 { GROUND } else { AIR })
+        .collect();
     let min_len = m.len.iter().cloned().fold(f64::INFINITY, f64::min);
     let tol = merge_tol.unwrap_or((min_len * 1e-4).max(1e-7));
 
@@ -201,6 +231,12 @@ pub fn build(wires: &[Wire], ground_plane: bool, merge_tol: Option<f64>) -> Resu
             continue;
         }
         if ends.len() < 2 {
+            if surface == Surface::Interface && m.nodes[n][2].abs() <= tol && m.p0[ends[0].0][2] + m.p1[ends[0].0][2] > 0.0 {
+                m.warnings.push(format!(
+                    "wire {} ends at ground level without continuing into the ground, so no current flows into the ground there; add a ground rod or radials below the surface to connect it",
+                    m.wire_of_seg[ends[0].0] + 1
+                ));
+            }
             continue;
         }
         let (sa, ea) = ends[0];
@@ -215,6 +251,42 @@ pub fn build(wires: &[Wire], ground_plane: bool, merge_tol: Option<f64>) -> Resu
         return Err(Error::new("with a ground plane every wire must be at z >= 0"));
     }
     Ok(m)
+}
+
+/// Segment fractions with a node at fraction `f0` (where a wire crosses the ground
+/// surface).  Uniform wires become uniform on each side; otherwise the nearest
+/// interior node moves to `f0` when that keeps both neighbours at least half their
+/// length, and only failing that is the straddling segment cut.  (A sliver next to
+/// a long segment would hurt the thin-wire integrals.)
+fn put_node_at(fracs: Vec<f64>, f0: f64, uniform: bool) -> Vec<f64> {
+    let n = fracs.len();
+    if uniform && n >= 2 {
+        let nb = ((f0 * n as f64).round() as usize).clamp(1, n - 1);
+        let mut out = vec![f0 / nb as f64; nb];
+        out.extend(vec![(1.0 - f0) / (n - nb) as f64; n - nb]);
+        return out;
+    }
+    let mut edges = vec![0.0];
+    for f in &fracs {
+        edges.push(edges.last().unwrap() + f);
+    }
+    // nearest interior node
+    if let Some((i, _)) = (1..n).map(|i| (i, (edges[i] - f0).abs())).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
+        let (left, right) = (f0 - edges[i - 1], edges[i + 1] - f0);
+        if left >= 0.5 * fracs[i - 1] && right >= 0.5 * fracs[i] {
+            let mut out = fracs.clone();
+            out[i - 1] = left;
+            out[i] = right;
+            return out;
+        }
+    }
+    // cut the straddling segment
+    let mut out = fracs.clone();
+    if let Some(i) = (0..n).find(|&i| f0 > edges[i] && f0 < edges[i + 1]) {
+        out[i] = f0 - edges[i];
+        out.insert(i + 1, edges[i + 1] - f0);
+    }
+    out
 }
 
 /// Half of a basis on `seg` whose node is at segment end `end` (0 start, 1 end);
@@ -294,7 +366,7 @@ mod tests {
 
     #[test]
     fn dipole_mesh() {
-        let m = build(&[Wire::new([0.0, 0.0, -0.25], [0.0, 0.0, 0.25], 1e-3, 10)], false, None).unwrap();
+        let m = build(&[Wire::new([0.0, 0.0, -0.25], [0.0, 0.0, 0.25], 1e-3, 10)], Surface::None, None).unwrap();
         assert_eq!(m.n_segments(), 10);
         assert_eq!(m.n_unknowns(), 9);
         assert_eq!(m.gap(0, 5).unwrap(), vec![(4, 1.0)]);
@@ -310,7 +382,7 @@ mod tests {
             Wire::new([0.0, 1.0, 0.0], [0.0, 0.0, 0.0], 1e-3, 4),
             Wire::new([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 1e-3, 4),
         ];
-        let m = build(&w, false, None).unwrap();
+        let m = build(&w, Surface::None, None).unwrap();
         assert_eq!(m.n_unknowns(), 3 * 3 + 2);
         // every wire end at the junction is crossed by at least one basis
         for (wi, node) in [(0, 0), (1, 4), (2, 0)] {
@@ -321,15 +393,32 @@ mod tests {
     #[test]
     fn tapered_segments() {
         let w = Wire { segments: Segments::Lengths(vec![1.0, 2.0, 4.0, 2.0, 1.0]), ..Wire::new([0.0; 3], [1.0, 0.0, 0.0], 1e-3, 1) };
-        let m = build(&[w], false, None).unwrap();
+        let m = build(&[w], Surface::None, None).unwrap();
         assert!((m.len[2] - 0.4).abs() < 1e-12);
         assert!((m.node_fraction(0, 3) - 0.7).abs() < 1e-12);
     }
 
     #[test]
     fn monopole_on_ground() {
-        let m = build(&[Wire::new([0.0; 3], [0.0, 0.0, 1.0], 1e-3, 5)], true, None).unwrap();
+        let m = build(&[Wire::new([0.0; 3], [0.0, 0.0, 1.0], 1e-3, 5)], Surface::Perfect, None).unwrap();
         assert_eq!(m.n_unknowns(), 5);
         assert_eq!(m.gap(0, 0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn crossing_wire_is_cut_at_the_surface() {
+        // uniform wire from z=-0.3 to z=0.7: uniform on each side, a node on the surface
+        let m = build(&[Wire::new([0.0, 0.0, -0.3], [0.0, 0.0, 0.7], 1e-3, 5)], Surface::Interface, None).unwrap();
+        assert_eq!(m.n_segments(), 5);
+        assert!(m.p1[1][2].abs() < 1e-12 || m.p1[0][2].abs() < 1e-12);
+        assert_eq!(m.medium.iter().filter(|&&x| x == GROUND).count() + m.medium.iter().filter(|&&x| x == AIR).count(), 5);
+        // tapered wire: the nearest node moves to the surface
+        let w = Wire { segments: Segments::Lengths(vec![1.0, 2.0, 4.0, 2.0, 1.0]), ..Wire::new([0.0, 0.0, -0.32], [0.0, 0.0, 0.68], 1e-3, 1) };
+        let m = build(&[w], Surface::Interface, None).unwrap();
+        assert_eq!(m.n_segments(), 5);
+        assert!(m.p1[1][2].abs() < 1e-12, "{:?}", m.p1);
+        // a wire ending on the surface from above alone gets a warning
+        let m = build(&[Wire::new([0.0; 3], [0.0, 0.0, 1.0], 1e-3, 4)], Surface::Interface, None).unwrap();
+        assert_eq!(m.warnings.len(), 1);
     }
 }

@@ -29,7 +29,8 @@ pub struct Seg {
     pub radius: f64,
 }
 
-pub fn pair(test: &Seg, src: &Seg, k: f64, n_outer: usize, n_inner: usize) -> PairIntegrals {
+/// `k` may be complex (inside lossy ground, k = k0 sqrt(eps)).
+pub fn pair(test: &Seg, src: &Seg, k: C, n_outer: usize, n_inner: usize) -> PairIntegrals {
     let (xo, wo) = gauss01(n_outer);
     let (xi, wi) = gauss01(n_inner);
     let a2 = 0.5 * (test.radius * test.radius + src.radius * src.radius);
@@ -52,10 +53,7 @@ pub fn pair(test: &Seg, src: &Seg, k: f64, n_outer: usize, n_inner: usize) -> Pa
             let q = along(src.p0, src.t, xs * lq);
             let dd = sub(r, q);
             let rr = (dot(dd, dd) + a2).sqrt();
-            let kr = k * rr;
-            // exp(-jkR) - 1 without cancellation
-            let h = (0.5 * kr).sin();
-            let f = C::new(-2.0 * h * h, -kr.sin()) / (four_pi * rr);
+            let f = expm1(C::new(0.0, -1.0) * k * rr) / (four_pi * rr);
             s0 += f * (lq * ws);
             s1 += f * (lq * ws * xs);
         }
@@ -70,4 +68,11 @@ pub fn pair(test: &Seg, src: &Seg, k: f64, n_outer: usize, n_inner: usize) -> Pa
         out.t[1][1] += src_fall * (wl * fall_o);
     }
     out
+}
+
+/// exp(z) - 1 without cancellation for small |z| (= 2 sinh(z/2) exp(z/2)).
+#[inline]
+pub fn expm1(z: C) -> C {
+    let h = z * 0.5;
+    2.0 * h.sinh() * h.exp()
 }

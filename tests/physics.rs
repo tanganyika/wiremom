@@ -260,10 +260,11 @@ fn sweep_shares_tables_accurately() {
 }
 
 #[test]
-fn wires_must_be_above_real_ground() {
+fn wire_ending_on_real_ground_is_a_free_end_with_a_warning() {
     let mut m = Model::new(vec![Wire::new([0.0; 3], [0.0, 0.0, 5.0], 0.002, 10)], Ground::Real(RealGround::AVERAGE));
     m.add_source(0, 5, ONE);
-    assert!(m.solve(14.2e6).is_err());
+    let s = m.solve(14.2e6).unwrap();
+    assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
 }
 
 #[test]

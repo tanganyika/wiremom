@@ -23,10 +23,10 @@ It is the engine behind the *wiremom* option in
 | Lumped loads: series/parallel RLC, fixed impedances, open circuits | ✅ |
 | Skin-effect loss (conductivity, relative permeability) and extra series L per metre (insulation) | ✅ |
 | Free space, perfect ground (wires may touch it), Sommerfeld real ground | ✅ |
+| Wires buried in or crossing lossy ground (radials, ground rods, buried counterpoises) | ✅ |
 | Impedance, VSWR, gain (θ/φ parts), radiated power, efficiency, current distribution | ✅ |
 | Current elements for an external far-field code | ✅ |
 | Parallel frequency sweeps sharing Sommerfeld tables | ✅ |
-| Wires buried in or connected to real ground | ⬜ roadmap |
 | NEC deck import/export | ⬜ roadmap |
 | Transmission-line and network elements | ⬜ roadmap |
 | Surface patches and wire-to-patch junctions | ⬜ roadmap |
@@ -73,6 +73,23 @@ this wire and the junction.
    tabulated per frequency and spline-interpolated. Tables are normalised in kR,
    so a sweep shares one table per frequency bucket (`ground_table_reuse`,
    ±1–2%).
+
+   **Wires in the ground** are handled the same way, from the other side of the
+   surface. A wire that crosses z = 0 gets a node on the surface (uniform wires
+   are re-cut evenly on each side), and every segment lies in one medium. The
+   kernel depends on the media of each pair of segments:
+
+   | Pair | Kernel |
+   |---|---|
+   | air–air | free space + Γ0 image + tabulated remainder (as above) |
+   | ground–ground | free space with the ground's complex wavenumber k√ε and permittivity, a −Γ0 image, and a remainder table built from inside the ground |
+   | air–ground | the field transmitted through the surface. Its quasi-static part — the free field with the charge term scaled by 2/(1+ε) — is integrated analytically; the remainder is evaluated directly as a Sommerfeld integral |
+
+   Buried currents radiate into the air through the Fresnel transmission
+   coefficients, found by reciprocity. A wire that ends on the surface from
+   above, without anything continuing below, carries no current into the ground:
+   point contacts have a very high spreading resistance, so real installations
+   use rods or radials. `Solution::warnings` reports such ends.
 4. **Solve and far field.** Z I = V by parallel LU, then the far field is
    integrated over the currents, adding the image weighted by the Fresnel
    coefficients over real ground.
@@ -89,6 +106,18 @@ this wire and the junction.
 - **Sommerfeld integrals** at 49 points over 7 soil and water types, matching
   the prototype to 1e-9. With perfect-conductor coefficients they also reproduce
   the closed-form image field.
+- **Wires in the ground** (no other code is available to compare against —
+  nec2c can't model them — so the checks are exact limits and classic results):
+  - with a transparent "ground" (ε = 1, σ = 0), buried, surface-crossing and
+    coupled wires reproduce free space exactly;
+  - the transmitted field matches the free field through a transparent ground,
+    and its quasi-static part matches its closed form;
+  - the reflection seen from inside the ground, with perfect-conductor
+    coefficients, reproduces the image field with the complex ground wavenumber;
+  - two 2 m ground rods at 10 kHz: 89.2 Ω, against 89.8 Ω from Dwight's
+    formula;
+  - the matrix stays symmetric (1.8e-5) with wires on both sides;
+  - buried radials: more radials raise a vertical's efficiency.
 - **Physics checks:**
   - dipole impedance and 2.15 dBi gain;
   - convergence with segmentation; tapered vs. uniform segmentation;

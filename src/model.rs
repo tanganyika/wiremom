@@ -10,9 +10,9 @@
 
 use crate::kernel::{self, PairIntegrals};
 use crate::lu;
-use crate::mesh::{self, Conductor, FALL, Mesh, RISE, Wire};
+use crate::mesh::{self, AIR, Conductor, FALL, GROUND, Mesh, RISE, Surface, Wire};
 use crate::quad::gauss01;
-use crate::sommerfeld::{self, RealGround, Table};
+use crate::sommerfeld::{self, RealGround, Side, Table};
 use crate::vec3::*;
 use crate::{C0, EPS0, ETA0, Error, MU0};
 use num_complex::Complex64 as C;
@@ -96,6 +96,7 @@ pub struct TableCache {
 
 #[derive(Clone, Copy, PartialEq)]
 struct TableKey {
+    side: u8,
     eps_r: u64,
     sigma: u64,
     bucket: i64,
@@ -105,10 +106,11 @@ struct TableKey {
 }
 
 impl TableKey {
-    fn new(g: RealGround, freq: f64, r_min: f64, r_max: f64, reuse: f64) -> (TableKey, f64) {
+    fn new(g: RealGround, side: Side, freq: f64, r_min: f64, r_max: f64, reuse: f64) -> (TableKey, f64) {
         let step = (1.0 + reuse).ln();
         let bucket = (freq.ln() / step).round() as i64;
         let key = TableKey {
+            side: side as u8,
             eps_r: g.eps_r.to_bits(),
             sigma: g.sigma.to_bits(),
             bucket,
@@ -143,15 +145,15 @@ impl TableCache {
         t
     }
 
-    fn get(&self, g: RealGround, freq: f64, r_min: f64, r_max: f64, reuse: f64) -> Arc<Table> {
+    fn get(&self, g: RealGround, side: Side, freq: f64, r_min: f64, r_max: f64, reuse: f64) -> Arc<Table> {
         if reuse <= 0.0 {
-            return Arc::new(Table::new(g, freq, r_min, r_max, 1.0, None));
+            return Arc::new(Table::new_side(g, freq, r_min, r_max, 1.0, None, side));
         }
-        let (key, f_b) = TableKey::new(g, freq, r_min, r_max, reuse);
+        let (key, f_b) = TableKey::new(g, side, freq, r_min, r_max, reuse);
         if let Some(t) = self.lookup(&key) {
             return t;
         }
-        let t = Arc::new(Table::new(g, f_b, r_min, r_max, 1.0 + reuse, None));
+        let t = Arc::new(Table::new_side(g, f_b, r_min, r_max, 1.0 + reuse, None, side));
         self.insert(key, t)
     }
 
@@ -162,17 +164,25 @@ impl TableCache {
             return Ok(());
         }
         let m = model.mesh()?;
-        let (r0, r1) = sommerfeld::table_range(&m, model.n_ground)?;
-        let mut need: Vec<(TableKey, f64)> = vec![];
-        for &f in freqs {
-            let (key, f_b) = TableKey::new(g, f, r0, r1, model.ground_table_reuse);
-            if !need.iter().any(|(k, _)| *k == key) && self.lookup(&key).is_none() {
-                need.push((key, f_b));
+        let mut need: Vec<(TableKey, f64, Side, f64, f64)> = vec![];
+        for (side, med) in [(Side::Air, AIR), (Side::Ground, GROUND)] {
+            let segs: Vec<usize> = (0..m.n_segments()).filter(|&s| m.medium[s] == med).collect();
+            if segs.is_empty() {
+                continue;
+            }
+            let (r0, r1) = sommerfeld::table_range_of(&m, model.n_ground, &segs)?;
+            for &f in freqs {
+                let (key, f_b) = TableKey::new(g, side, f, r0, r1, model.ground_table_reuse);
+                if !need.iter().any(|(k, ..)| *k == key) && self.lookup(&key).is_none() {
+                    need.push((key, f_b, side, r0, r1));
+                }
             }
         }
         let reuse = model.ground_table_reuse;
-        let built: Vec<(TableKey, Arc<Table>)> =
-            need.into_par_iter().map(|(key, f_b)| (key, Arc::new(Table::new(g, f_b, r0, r1, 1.0 + reuse, None)))).collect();
+        let built: Vec<(TableKey, Arc<Table>)> = need
+            .into_par_iter()
+            .map(|(key, f_b, side, r0, r1)| (key, Arc::new(Table::new_side(g, f_b, r0, r1, 1.0 + reuse, None, side))))
+            .collect();
         for (key, t) in built {
             self.insert(key, t);
         }
@@ -225,7 +235,12 @@ impl Model {
     }
 
     pub fn mesh(&self) -> Result<Mesh, Error> {
-        mesh::build(&self.wires, self.ground == Ground::Perfect, self.merge_tol)
+        let surface = match self.ground {
+            Ground::Free => Surface::None,
+            Ground::Perfect => Surface::Perfect,
+            Ground::Real(_) => Surface::Interface,
+        };
+        mesh::build(&self.wires, surface, self.merge_tol)
     }
 
     /// Impedance matrix (row-major, n_unknowns²) for `mesh` at `freq` (Hz).
@@ -237,31 +252,60 @@ impl Model {
     /// Sommerfeld remainder table (testing) and then no closed-form image is added.
     pub fn impedance_matrix_with(&self, m: &Mesh, freq: f64, table: Option<&Table>) -> Result<Vec<C>, Error> {
         let omega = 2.0 * PI * freq;
-        let k = omega / C0;
+        let k = C::new(omega / C0, 0.0);
         let n = m.n_segments();
         let jwmu = C::new(0.0, omega * MU0);
         let inv_jweps = C::new(0.0, -1.0 / (omega * EPS0));
+        let zero = C::new(0.0, 0.0);
 
-        let (img, real_k) = match self.ground {
-            Ground::Free => (None, None),
-            Ground::Perfect => (Some(C::new(1.0, 0.0)), None),
+        // segments on each side of the surface, and their index within that side
+        let air: Vec<usize> = (0..n).filter(|&s| m.medium[s] == AIR).collect();
+        let gnd: Vec<usize> = (0..n).filter(|&s| m.medium[s] == GROUND).collect();
+        let mut loc = vec![0usize; n];
+        for (i, &s) in air.iter().enumerate() {
+            loc[s] = i;
+        }
+        for (i, &s) in gnd.iter().enumerate() {
+            loc[s] = i;
+        }
+
+        // ground: image scale in the air, and the tabulated / direct remainders
+        let mut img_air = zero;
+        let mut eps = C::new(1.0, 0.0);
+        let mut g0 = zero;
+        let (mut k_air, mut k_gnd, mut k_cross) = (None, None, None);
+        match self.ground {
+            Ground::Free => {}
+            Ground::Perfect => img_air = C::new(1.0, 0.0),
             Ground::Real(g) => {
-                if m.p0.iter().chain(m.p1.iter()).any(|p| p[2] <= 0.0) {
-                    return Err(Error::new(
-                        "over real ground all wires must be above z = 0 (wires buried in or touching real ground are not supported yet)",
-                    ));
+                eps = g.eps_c(freq);
+                g0 = g.gamma0(freq);
+                img_air = if table.is_some() { zero } else { g0 };
+                if !air.is_empty() {
+                    k_air = Some(match table {
+                        Some(t) => sommerfeld::segment_integrals_of(t, m, self.n_ground, freq, &air),
+                        None => {
+                            let (r0, r1) = sommerfeld::table_range_of(m, self.n_ground, &air)?;
+                            let t = self.tables.get(g, Side::Air, freq, r0, r1, self.ground_table_reuse);
+                            sommerfeld::segment_integrals_of(&t, m, self.n_ground, freq, &air)
+                        }
+                    });
                 }
-                let k_int = match table {
-                    Some(t) => sommerfeld::segment_integrals(t, m, self.n_ground, freq),
-                    None => {
-                        let (r0, r1) = sommerfeld::table_range(m, self.n_ground)?;
-                        let t = self.tables.get(g, freq, r0, r1, self.ground_table_reuse);
-                        sommerfeld::segment_integrals(&t, m, self.n_ground, freq)
+                if !gnd.is_empty() {
+                    let (r0, r1) = sommerfeld::table_range_of(m, self.n_ground, &gnd)?;
+                    let t = self.tables.get(g, Side::Ground, freq, r0, r1, self.ground_table_reuse);
+                    k_gnd = Some(sommerfeld::segment_integrals_of(&t, m, self.n_ground, freq, &gnd));
+                    if !air.is_empty() {
+                        k_cross = Some(sommerfeld::cross_integrals(m, freq, eps, &gnd, &air));
                     }
-                };
-                (Some(if table.is_some() { C::new(0.0, 0.0) } else { g.gamma0(freq) }), Some(k_int))
+                }
             }
-        };
+        }
+        let k_ground = k * eps.sqrt();
+        let inv_jweps_g = inv_jweps / eps;
+        // charge seen across the surface: quasi-static transmission 2/(1+eps)
+        let c_cross = 2.0 / (1.0 + eps);
+        let (na, ng) = (air.len(), gnd.len());
 
         // per segment pair: vector-potential block v[a][b] and scalar term s
         let seg = |s: usize| kernel::Seg { p0: m.p0[s], t: m.t[s], len: m.len[s], radius: m.radius[s] };
@@ -272,27 +316,39 @@ impl Model {
                 (0..n)
                     .map(|q| {
                         let sq = seg(q);
-                        let f: PairIntegrals = kernel::pair(&sp, &sq, k, self.n_outer, self.n_inner);
                         let tt = dot(m.t[p], m.t[q]);
+                        let (mp, mq) = (m.medium[p], m.medium[q]);
+                        let (kk, s_scale, img, inv_e) = match (mp, mq) {
+                            (AIR, AIR) => (k, C::new(1.0, 0.0), img_air, inv_jweps),
+                            (GROUND, GROUND) => (k_ground, C::new(1.0, 0.0), -g0, inv_jweps_g),
+                            _ => (k, c_cross, zero, inv_jweps),
+                        };
+                        let f: PairIntegrals = kernel::pair(&sp, &sq, kk, self.n_outer, self.n_inner);
                         let mut v = f.t.map(|r| r.map(|x| jwmu * tt * x));
-                        let mut s = inv_jweps * f.s;
-                        if let Some(g) = img {
-                            if g != C::new(0.0, 0.0) {
-                                // image: reflected segment with negated current and charge
-                                let si = kernel::Seg { p0: reflect(m.p0[q]), t: reflect(m.t[q]), ..sq };
-                                let fi = kernel::pair(&sp, &si, k, self.n_outer, self.n_inner);
-                                let tti = dot(m.t[p], reflect(m.t[q]));
-                                for a in 0..2 {
-                                    for b in 0..2 {
-                                        v[a][b] -= g * jwmu * tti * fi.t[a][b];
-                                    }
+                        let mut s = s_scale * inv_e * f.s;
+                        if img != zero {
+                            // image: reflected segment with negated current and charge
+                            let si = kernel::Seg { p0: reflect(m.p0[q]), t: reflect(m.t[q]), ..sq };
+                            let fi = kernel::pair(&sp, &si, kk, self.n_outer, self.n_inner);
+                            let tti = dot(m.t[p], reflect(m.t[q]));
+                            for a in 0..2 {
+                                for b in 0..2 {
+                                    v[a][b] -= img * jwmu * tti * fi.t[a][b];
                                 }
-                                s -= g * inv_jweps * fi.s;
                             }
+                            s -= img * inv_e * fi.s;
                         }
-                        if let Some(kk) = &real_k {
-                            // reflected field E = D . J tested: Z = -<t, E>
-                            let kp = kk[p * n + q];
+                        // remainder fields E = D . J tested: Z = -<t, E>
+                        let rem: Option<[[C; 2]; 2]> = match (mp, mq) {
+                            (AIR, AIR) => k_air.as_ref().map(|kk| kk[loc[p] * na + loc[q]]),
+                            (GROUND, GROUND) => k_gnd.as_ref().map(|kk| kk[loc[p] * ng + loc[q]]),
+                            (GROUND, _) => k_cross.as_ref().map(|kk| kk[loc[p] * na + loc[q]]),
+                            _ => k_cross.as_ref().map(|kk| {
+                                let x = kk[loc[q] * na + loc[p]];
+                                [[x[0][0], x[1][0]], [x[0][1], x[1][1]]]
+                            }),
+                        };
+                        if let Some(kp) = rem {
                             for a in 0..2 {
                                 for b in 0..2 {
                                     v[a][b] -= kp[a][b];
@@ -386,6 +442,7 @@ impl Model {
         let t_fill_ms = (t1 - t0).as_secs_f64() * 1e3;
         let t_solve_ms = t1.elapsed().as_secs_f64() * 1e3;
         Ok(Solution {
+            warnings: m.warnings.clone(),
             mesh: m,
             freq,
             currents: v,
@@ -424,8 +481,11 @@ pub struct Solution {
     pub sources: Vec<Source>,
     gaps: Vec<Vec<(usize, f64)>>,
     pub ground: Ground,
-    /// far-field current elements (6 Gauss points per segment), built on first use
-    elements: OnceLock<Vec<(V3, [C; 3])>>,
+    /// far-field current elements (6 Gauss points per segment) and their media,
+    /// built on first use
+    elements: OnceLock<(Vec<(V3, [C; 3])>, Vec<u8>)>,
+    /// notes about the geometry (see `Mesh::warnings`)
+    pub warnings: Vec<String>,
     /// matrix fill (incl. meshing and Sommerfeld tables) and LU solve times
     pub t_fill_ms: f64,
     pub t_solve_ms: f64,
@@ -495,10 +555,31 @@ impl Solution {
         let rhat = [st * cp, st * sp, ct];
         let th = [ct * cp, ct * sp, -st];
         let ph = [-sp, cp, 0.0];
-        let els = self.elements.get_or_init(|| self.current_elements(6));
+        let (els, med) = self.elements.get_or_init(|| {
+            let e = self.current_elements(6);
+            let m = &self.mesh;
+            let med = (0..m.n_segments()).flat_map(|s| std::iter::repeat_n(m.medium[s], 6)).collect();
+            (e, med)
+        });
+        if self.ground != Ground::Free && theta > PI / 2.0 + 1e-12 {
+            return (C::new(0.0, 0.0), C::new(0.0, 0.0));
+        }
+        let trans = match self.ground {
+            Ground::Real(g) if med.contains(&GROUND) => Some(sommerfeld::transmission(&g, self.freq, theta.min(PI / 2.0), phi)),
+            _ => None,
+        };
         let mut nd = [C::new(0.0, 0.0); 3];
         let mut ni = [C::new(0.0, 0.0); 3];
-        for (p, c) in els {
+        let (mut et_b, mut ep_b) = (C::new(0.0, 0.0), C::new(0.0, 0.0));
+        for ((p, c), &md) in els.iter().zip(med) {
+            if md == GROUND {
+                // buried current: transmitted through the surface (by reciprocity)
+                let (t_te, t_tm, e, kz2) = trans.unwrap();
+                let phase = C::from_polar(1.0, k * st * (cp * p[0] + sp * p[1])) * (C::new(0.0, -1.0) * kz2 * (-p[2])).exp();
+                et_b += t_tm * (e[0] * c[0] + e[1] * c[1] + e[2] * c[2]) * phase;
+                ep_b += t_te * (ph[0] * c[0] + ph[1] * c[1]) * phase;
+                continue;
+            }
             let ph_d = C::from_polar(1.0, k * dot(rhat, *p));
             for i in 0..3 {
                 nd[i] += c[i] * ph_d;
@@ -517,15 +598,14 @@ impl Solution {
         let mut e_ph = pref * proj(&nd, ph);
         match self.ground {
             Ground::Free => {}
-            _ if theta > PI / 2.0 + 1e-12 => return (C::new(0.0, 0.0), C::new(0.0, 0.0)),
             Ground::Perfect => {
                 e_th += pref * proj(&ni, th);
                 e_ph += pref * proj(&ni, ph);
             }
             Ground::Real(g) => {
                 let (g_te, g_tm) = g.reflection(self.freq, theta.min(PI / 2.0));
-                e_th += g_tm * pref * proj(&ni, th);
-                e_ph -= g_te * pref * proj(&ni, ph);
+                e_th += g_tm * pref * proj(&ni, th) + pref * et_b;
+                e_ph += -g_te * pref * proj(&ni, ph) + pref * ep_b;
             }
         }
         (e_th, e_ph)
