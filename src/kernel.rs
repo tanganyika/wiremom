@@ -102,3 +102,23 @@ pub fn line_green(r: V3, src: &Seg, a: f64, k: C, n: usize) -> (C, C) {
     }
     (s0, s1)
 }
+
+/// Gauss order for a segment pair: the full `n_max` for neighbours, fewer as the
+/// pair separates (the singular part is analytic, so only the smooth remainder
+/// and the outer integral need points).  Distance between centres relative to the
+/// longer segment: < 1.5 -> n_max, < 3 -> 6, < 6 -> 4, beyond -> 3.
+pub fn order(test: &Seg, src: &Seg, n_max: usize) -> usize {
+    let c = |s: &Seg| along(s.p0, s.t, 0.5 * s.len);
+    let d = norm(sub(c(test), c(src)));
+    let l = test.len.max(src.len);
+    let n = if d < 1.5 * l {
+        n_max
+    } else if d < 3.0 * l {
+        6
+    } else if d < 6.0 * l {
+        4
+    } else {
+        3
+    };
+    n.min(n_max)
+}

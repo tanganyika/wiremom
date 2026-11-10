@@ -12,7 +12,7 @@ use crate::kernel::{self, PairIntegrals};
 use crate::lu;
 use crate::mesh::{self, AIR, Conductor, FALL, GROUND, Mesh, RISE, Surface, Wire};
 use crate::quad::gauss01;
-use crate::sommerfeld::{self, RealGround, Side, Table};
+use crate::sommerfeld::{self, Blend, Eval, RealGround, Side, Table, Window};
 use crate::surface;
 use crate::vec3::*;
 use crate::{C0, EPS0, ETA0, Error, MU0};
@@ -158,6 +158,9 @@ pub struct TableCache {
 #[derive(Clone, Copy, PartialEq)]
 struct TableKey {
     side: u8,
+    theta: u64,
+    /// frequency bits of a table built exactly at one frequency (0 for buckets)
+    exact: u64,
     eps_r: u64,
     sigma: u64,
     bucket: i64,
@@ -167,11 +170,14 @@ struct TableKey {
 }
 
 impl TableKey {
-    fn new(g: RealGround, side: Side, freq: f64, r_min: f64, r_max: f64, reuse: f64) -> (TableKey, f64) {
+    /// Key and centre frequency of frequency bucket `bucket` (width ln(1+reuse)).
+    fn new(g: RealGround, side: Side, bucket: i64, win: Window, reuse: f64) -> (TableKey, f64) {
+        let (r_min, r_max) = (win.r_min, win.r_max);
         let step = (1.0 + reuse).ln();
-        let bucket = (freq.ln() / step).round() as i64;
         let key = TableKey {
             side: side as u8,
+            theta: win.theta_min.to_bits(),
+            exact: 0,
             eps_r: g.eps_r.to_bits(),
             sigma: g.sigma.to_bits(),
             bucket,
@@ -206,44 +212,63 @@ impl TableCache {
         t
     }
 
-    fn get(&self, g: RealGround, side: Side, freq: f64, r_min: f64, r_max: f64, reuse: f64) -> Arc<Table> {
+    /// The two buckets around `freq` and the blend weight toward the upper one.
+    fn buckets(freq: f64, reuse: f64) -> (i64, i64, f64) {
+        let x = freq.ln() / (1.0 + reuse).ln();
+        let lo = x.floor();
+        (lo as i64, lo as i64 + 1, x - lo)
+    }
+
+    fn get(&self, g: RealGround, side: Side, freq: f64, win: Window, reuse: f64) -> Arc<dyn Eval> {
         if reuse <= 0.0 {
-            return Arc::new(Table::new_side(g, freq, r_min, r_max, 1.0, None, side));
+            return Arc::new(Table::new_window(g, freq, win, 1.0, None, side));
         }
-        let (key, f_b) = TableKey::new(g, side, freq, r_min, r_max, reuse);
+        let (lo, hi, w) = Self::buckets(freq, reuse);
+        let (klo, _) = TableKey::new(g, side, lo, win, reuse);
+        let (khi, _) = TableKey::new(g, side, hi, win, reuse);
+        if let (Some(a), Some(b)) = (self.lookup(&klo), self.lookup(&khi)) {
+            // a sweep prepared the buckets: blend them
+            return Arc::new(Blend { a, b, w });
+        }
+        // a single frequency: one exact table (cached for repeat calculations)
+        let (mut key, _) = TableKey::new(g, side, 0, win, reuse);
+        key.exact = freq.to_bits();
         if let Some(t) = self.lookup(&key) {
             return t;
         }
-        let t = Arc::new(Table::new_side(g, f_b, r_min, r_max, 1.0 + reuse, None, side));
+        let t = Arc::new(Table::new_window(g, freq, win, 1.0, None, side));
         self.insert(key, t)
     }
 
-    /// Build (in parallel) every table that solving `model` at `freqs` will need.
+    /// Build (in parallel) the frequency-bucket tables a sweep over `freqs` needs;
+    /// solves then blend the two around each frequency.  Without this, each
+    /// frequency gets its own exact table.
     pub fn prepare(&self, model: &Model, freqs: &[f64]) -> Result<(), Error> {
         let Ground::Real(g) = model.ground else { return Ok(()) };
         if model.ground_table_reuse <= 0.0 {
             return Ok(());
         }
         let m = model.mesh()?;
-        let mut need: Vec<(TableKey, f64, Side, f64, f64)> = vec![];
-        for (side, med) in [(Side::Air, AIR), (Side::Ground, GROUND)] {
-            let segs: Vec<usize> = (0..m.n_segments()).filter(|&s| m.medium[s] == med).collect();
-            if segs.is_empty() {
+        let mut need: Vec<(TableKey, f64, Side, Window)> = vec![];
+        for side in [Side::Air, Side::Ground] {
+            let pts = if side == Side::Air { sommerfeld::air_points(&m, model.n_ground) } else { sommerfeld::ground_points(&m, model.n_ground) };
+            if pts.is_empty() {
                 continue;
             }
-            let (r0, r1) = sommerfeld::table_range_of(&m, model.n_ground, &segs)?;
+            let win = sommerfeld::window_of_points(&pts)?;
             for &f in freqs {
-                let (key, f_b) = TableKey::new(g, side, f, r0, r1, model.ground_table_reuse);
-                if !need.iter().any(|(k, ..)| *k == key) && self.lookup(&key).is_none() {
-                    need.push((key, f_b, side, r0, r1));
+                let (lo, hi, _) = Self::buckets(f, model.ground_table_reuse);
+                for b in [lo, hi] {
+                    let (key, f_b) = TableKey::new(g, side, b, win, model.ground_table_reuse);
+                    if !need.iter().any(|(k, ..)| *k == key) && self.lookup(&key).is_none() {
+                        need.push((key, f_b, side, win));
+                    }
                 }
             }
         }
         let reuse = model.ground_table_reuse;
-        let built: Vec<(TableKey, Arc<Table>)> = need
-            .into_par_iter()
-            .map(|(key, f_b, side, r0, r1)| (key, Arc::new(Table::new_side(g, f_b, r0, r1, 1.0 + reuse, None, side))))
-            .collect();
+        let built: Vec<(TableKey, Arc<Table>)> =
+            need.into_par_iter().map(|(key, f_b, side, win)| (key, Arc::new(Table::new_window(g, f_b, win, 1.0 + reuse, None, side)))).collect();
         for (key, t) in built {
             self.insert(key, t);
         }
@@ -262,11 +287,15 @@ pub struct Model {
     pub n_inner: usize,
     /// Gauss points per segment for the Sommerfeld remainder.
     pub n_ground: usize,
+    /// Fewer quadrature points for well-separated pairs of segments/triangles
+    /// (default on; changes results by ~1e-5 relative, much faster).
+    pub adaptive: bool,
     /// Segment ends closer than this (m) are joined; None = 1e-4 of the shortest
     /// segment, at least 1e-7 m.
     pub merge_tol: Option<f64>,
     /// Reuse a Sommerfeld table within this relative frequency distance; 0 rebuilds
-    /// it for every frequency.  Reuse within ±1% costs ~0.1% in impedance.
+    /// it for every frequency.  The two tables around each frequency are blended,
+    /// so 0.04 (the default) costs under ~5e-5 in impedance.
     pub ground_table_reuse: f64,
     pub tables: TableCache,
     /// Transmission lines and other two-ports between gaps.
@@ -285,8 +314,9 @@ impl Model {
             n_outer: 8,
             n_inner: 8,
             n_ground: 6,
+            adaptive: true,
             merge_tol: None,
-            ground_table_reuse: 0.02,
+            ground_table_reuse: 0.04,
             tables: TableCache::default(),
             networks: vec![],
             surfaces: vec![],
@@ -319,9 +349,9 @@ impl Model {
     }
 
     /// The air-side Sommerfeld table for this mesh (wires and surfaces).
-    fn air_table(&self, m: &Mesh, g: RealGround, freq: f64) -> Result<Arc<Table>, Error> {
-        let (r0, r1) = sommerfeld::range_of_points(&sommerfeld::air_points(m, self.n_ground))?;
-        Ok(self.tables.get(g, Side::Air, freq, r0, r1, self.ground_table_reuse))
+    fn air_table(&self, m: &Mesh, g: RealGround, freq: f64) -> Result<Arc<dyn Eval>, Error> {
+        let win = sommerfeld::window_of_points(&sommerfeld::air_points(m, self.n_ground))?;
+        Ok(self.tables.get(g, Side::Air, freq, win, self.ground_table_reuse))
     }
 
     /// Impedance matrix (row-major, n_unknowns²) for `mesh` at `freq` (Hz).
@@ -331,7 +361,7 @@ impl Model {
 
     /// As [`impedance_matrix`](Self::impedance_matrix); `table` replaces the
     /// Sommerfeld remainder table (testing) and then no closed-form image is added.
-    pub fn impedance_matrix_with(&self, m: &Mesh, freq: f64, table: Option<&Table>) -> Result<Vec<C>, Error> {
+    pub fn impedance_matrix_with(&self, m: &Mesh, freq: f64, table: Option<&dyn Eval>) -> Result<Vec<C>, Error> {
         let omega = 2.0 * PI * freq;
         let k = C::new(omega / C0, 0.0);
         let n = m.n_segments();
@@ -357,7 +387,7 @@ impl Model {
         let (mut k_air, mut k_gnd, mut k_cross) = (None, None, None);
         // the air-side table (built here unless `table` overrides it), also used by
         // the surfaces
-        let mut air_owned: Option<Arc<Table>> = None;
+        let mut air_owned: Option<Arc<dyn Eval>> = None;
         match self.ground {
             Ground::Free => {}
             Ground::Perfect => img_air = C::new(1.0, 0.0),
@@ -373,9 +403,9 @@ impl Model {
                     k_air = Some(sommerfeld::segment_integrals_of(t, m, self.n_ground, freq, &air));
                 }
                 if !gnd.is_empty() {
-                    let (r0, r1) = sommerfeld::table_range_of(m, self.n_ground, &gnd)?;
-                    let t = self.tables.get(g, Side::Ground, freq, r0, r1, self.ground_table_reuse);
-                    k_gnd = Some(sommerfeld::segment_integrals_of(&t, m, self.n_ground, freq, &gnd));
+                    let win = sommerfeld::window_of_points(&sommerfeld::ground_points(m, self.n_ground))?;
+                    let t = self.tables.get(g, Side::Ground, freq, win, self.ground_table_reuse);
+                    k_gnd = Some(sommerfeld::segment_integrals_of(&*t, m, self.n_ground, freq, &gnd));
                     if !air.is_empty() {
                         k_cross = Some(sommerfeld::cross_integrals(m, freq, eps, &gnd, &air));
                     }
@@ -404,13 +434,25 @@ impl Model {
                             (GROUND, GROUND) => (k_ground, C::new(1.0, 0.0), -g0, inv_jweps_g),
                             _ => (k, c_cross, zero, inv_jweps),
                         };
-                        let f: PairIntegrals = kernel::pair(&sp, &sq, kk, self.n_outer, self.n_inner);
+                        let (no, ni) = if self.adaptive {
+                            let n = kernel::order(&sp, &sq, self.n_outer.max(self.n_inner));
+                            (n.min(self.n_outer), n.min(self.n_inner))
+                        } else {
+                            (self.n_outer, self.n_inner)
+                        };
+                        let f: PairIntegrals = kernel::pair(&sp, &sq, kk, no, ni);
                         let mut v = f.t.map(|r| r.map(|x| jwmu * tt * x));
                         let mut s = s_scale * inv_e * f.s;
                         if img != zero {
                             // image: reflected segment with negated current and charge
                             let si = kernel::Seg { p0: reflect(m.p0[q]), t: reflect(m.t[q]), ..sq };
-                            let fi = kernel::pair(&sp, &si, kk, self.n_outer, self.n_inner);
+                            let (no, ni) = if self.adaptive {
+                                let n = kernel::order(&sp, &si, self.n_outer.max(self.n_inner));
+                                (n.min(self.n_outer), n.min(self.n_inner))
+                            } else {
+                                (self.n_outer, self.n_inner)
+                            };
+                            let fi = kernel::pair(&sp, &si, kk, no, ni);
                             let tti = dot(m.t[p], reflect(m.t[q]));
                             for a in 0..2 {
                                 for b in 0..2 {
@@ -502,7 +544,7 @@ impl Model {
 
     /// Extend the wire matrix with the surfaces' RWG unknowns: plate–plate and
     /// wire–plate interactions, their ground images and the real-ground remainder.
-    fn add_surfaces(&self, m: &Mesh, zw: Vec<C>, freq: f64, img: C, table: Option<&Table>) -> Result<Vec<C>, Error> {
+    fn add_surfaces(&self, m: &Mesh, zw: Vec<C>, freq: f64, img: C, table: Option<&dyn Eval>) -> Result<Vec<C>, Error> {
         let sm = &m.surf;
         let nw = m.basis.len();
         let ns = sm.rwg.len();
@@ -637,7 +679,7 @@ impl Model {
     /// matrix) continues as a surface part S_J around its vertex.  Adds ⟨S_J, L y⟩ to
     /// row and column J for every unknown y, and ⟨S_J, L S_K⟩ between junctions.
     #[allow(clippy::too_many_arguments)]
-    fn add_junctions(&self, m: &Mesh, z: &mut [C], n: usize, freq: f64, img: C, table: Option<&Table>, verts: &[[V3; 3]], iverts: &[[V3; 3]]) {
+    fn add_junctions(&self, m: &Mesh, z: &mut [C], n: usize, freq: f64, img: C, table: Option<&dyn Eval>, verts: &[[V3; 3]], iverts: &[[V3; 3]]) {
         let sm = &m.surf;
         let nw = m.basis.len();
         let omega = 2.0 * PI * freq;
@@ -1006,8 +1048,42 @@ impl Solution {
         out
     }
 
+    /// Current elements for the far field, with their media: Gauss points along
+    /// each segment (2 while the segment is under ~λ/8, more for longer ones) and
+    /// the 3- or 7-point rule on triangles (by their electrical size).
+    fn far_elements(&self) -> (Vec<(V3, [C; 3])>, Vec<u8>) {
+        let m = &self.mesh;
+        let k = 2.0 * PI * self.freq / C0;
+        let amps = self.segment_amplitudes();
+        let mut out = vec![];
+        let mut med = vec![];
+        for s in 0..m.n_segments() {
+            let n = ((2.5 * k * m.len[s]).ceil() as usize).clamp(2, 16);
+            let (x, w) = gauss01(n);
+            for (&xi, &wi) in x.iter().zip(w) {
+                let i = amps[s][RISE] * xi + amps[s][FALL] * (1.0 - xi);
+                let mom = i * (wi * m.len[s]);
+                out.push((along(m.p0[s], m.t[s], xi * m.len[s]), [mom * m.t[s][0], mom * m.t[s][1], mom * m.t[s][2]]));
+                med.push(m.medium[s]);
+            }
+        }
+        let sm = &m.surf;
+        // small triangles: the 3-point rule (exact for their linear currents' moments
+        // up to the phase variation across them)
+        let small = sm.area.iter().all(|a| k * a.sqrt() < 0.8);
+        out.extend(self.surface_elements_with(if small { &surface::TRI3[..] } else { &surface::TRI7[..] }));
+        med.resize(out.len(), AIR);
+        (out, med)
+    }
+
     /// Surface current elements: (point, J·dA) at the 7-point rule of each triangle.
     pub fn surface_elements(&self) -> Vec<(V3, [C; 3])> {
+        self.surface_elements_with(&surface::TRI7[..])
+    }
+
+    /// Surface current elements on the given triangle rule (barycentric points,
+    /// weights summing to 1), plus the junctions' surface parts.
+    fn surface_elements_with(&self, rule: &[([f64; 3], f64)]) -> Vec<(V3, [C; 3])> {
         let m = &self.mesh;
         let sm = &m.surf;
         let nw = m.basis.len();
@@ -1020,7 +1096,8 @@ impl Solution {
         let mut out = Vec::with_capacity(sm.tris.len() * 7);
         for (t, list) in on_tri.iter().enumerate() {
             let v = sm.tri_verts(t);
-            for (r, (_, w)) in surface::tri_points(&v).iter().zip(surface::TRI7) {
+            for &(bc, w) in rule {
+                let r = &[0, 1, 2].map(|i| bc[0] * v[0][i] + bc[1] * v[1][i] + bc[2] * v[2][i]);
                 let mut j = [C::new(0.0, 0.0); 3];
                 for &(bi, h, len) in list {
                     let f = h.sign * len / (2.0 * sm.area[t]);
@@ -1050,10 +1127,7 @@ impl Solution {
         let th = [ct * cp, ct * sp, -st];
         let ph = [-sp, cp, 0.0];
         let (els, med) = self.elements.get_or_init(|| {
-            let e = self.current_elements(6);
-            let m = &self.mesh;
-            let mut med: Vec<u8> = (0..m.n_segments()).flat_map(|s| std::iter::repeat_n(m.medium[s], 6)).collect();
-            med.resize(e.len(), AIR); // surfaces are always in the air
+            let (e, med) = self.far_elements();
             (e, med)
         });
         if self.ground != Ground::Free && theta > PI / 2.0 + 1e-12 {
@@ -1075,13 +1149,23 @@ impl Solution {
                 ep_b += t_te * (ph[0] * c[0] + ph[1] * c[1]) * phase;
                 continue;
             }
-            let ph_d = C::from_polar(1.0, k * dot(rhat, *p));
+            if self.ground == Ground::Free {
+                let ph_d = C::from_polar(1.0, k * dot(rhat, *p));
+                for i in 0..3 {
+                    nd[i] += c[i] * ph_d;
+                }
+                continue;
+            }
+            // direct and image phases share the horizontal part
+            let ph_h = C::from_polar(1.0, k * (rhat[0] * p[0] + rhat[1] * p[1]));
+            let ph_v = C::from_polar(1.0, k * rhat[2] * p[2]);
+            let ph_d = ph_h * ph_v;
             for i in 0..3 {
                 nd[i] += c[i] * ph_d;
             }
-            if self.ground != Ground::Free {
+            {
                 // image current -P J at the mirror point
-                let ph_i = C::from_polar(1.0, k * dot(rhat, reflect(*p)));
+                let ph_i = ph_h * ph_v.conj();
                 ni[0] -= c[0] * ph_i;
                 ni[1] -= c[1] * ph_i;
                 ni[2] += c[2] * ph_i;

@@ -88,7 +88,7 @@ this wire and the junction.
    `Γ0 = (ε−1)/(ε+1)` image is handled analytically, and the remainder is
    tabulated per frequency and spline-interpolated. Tables are normalised in kR,
    so a sweep shares one table per frequency bucket (`ground_table_reuse`,
-   ±1–2%).
+   blended between neighbouring frequencies).
 
    **Wires in the ground** are handled the same way, from the other side of the
    surface. A wire that crosses z = 0 gets a node on the surface (uniform wires
@@ -185,6 +185,31 @@ No Python is needed to build, run or test the crate. The prototype in `python/`
 is a frozen reference: `python/tools/make_reference.py` regenerates the JSON if
 the reference cases ever need to change.
 
+## Speed
+
+`cargo run --release --example bench` times a 3-element Yagi (70 segments). On
+12 threads it gives:
+
+| | Solve | Pattern (5,000 directions) | 24-point sweep |
+|---|---|---|---|
+| Free space | 2 ms | 12 ms | 12 ms |
+| 15 m over average ground | 25 ms | 29 ms | 230 ms |
+
+What keeps it fast:
+
+- **Adaptive quadrature:** distant segment pairs get fewer Gauss points. The
+  singular part is analytic anyway; this changes impedances by ~1e-9.
+- **Far-field samples sized to the segments:** 2 per segment under about λ/8,
+  more for longer ones.
+- **Ground tables limited to the geometry:** they cover only the distances and
+  angles the antenna produces.
+- **Blended tables in sweeps:** a sweep builds tables at frequency buckets 4%
+  apart and blends the two around each frequency (error under ~5e-5). A single
+  solve builds one exact table.
+
+`cargo run --release --example accuracy` compares the fast settings with full
+quadrature, and `--example reuse` the blended tables with exact ones.
+
 ## Known limitations
 
 These are the weaker spots, with how far they have been checked.
@@ -209,7 +234,7 @@ These are the weaker spots, with how far they have been checked.
   (other than as flat triangles), and NEC deck import/export (the application
   using this crate does that).
 - **Speed:**
-  - air-to-ground couplings of buried wires are computed directly (about 1.4 s
+  - air-to-ground couplings of buried wires are computed directly (about 0.8 s
     per frequency for a vertical with 8 buried radials); tabulating them would
     help;
   - the matrix is dense, so memory grows as N² and the solve as N³ (about 2,000

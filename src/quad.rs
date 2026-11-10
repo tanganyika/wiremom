@@ -4,9 +4,10 @@ use std::sync::OnceLock;
 
 /// Gauss-Legendre nodes and weights on [0, 1], ascending (n is clamped to 1..=128).
 pub fn gauss01(n: usize) -> &'static (Vec<f64>, Vec<f64>) {
-    static CACHE: OnceLock<Vec<(Vec<f64>, Vec<f64>)>> = OnceLock::new();
-    let table = CACHE.get_or_init(|| (0..=128).map(compute).collect());
-    &table[n.clamp(1, 128)]
+    // each rule is computed the first time it's asked for
+    static CACHE: [OnceLock<(Vec<f64>, Vec<f64>)>; 129] = [const { OnceLock::new() }; 129];
+    let n = n.clamp(1, 128);
+    CACHE[n].get_or_init(|| compute(n))
 }
 
 fn compute(n: usize) -> (Vec<f64>, Vec<f64>) {

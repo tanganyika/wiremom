@@ -212,13 +212,13 @@ fn nodes(rho: f64, h: f64, k: f64, k2: Option<C>, out: &mut Vec<(Kind, C, C)>) {
     }
     buf.clear();
     if rho > h {
-        composite(0.0, 40.0 / rho, 32, 8, Some(0.25 * k), &mut buf);
+        composite(0.0, 40.0 / rho, 16, 8, Some(0.25 * k), &mut buf);
         for &(t, w) in &buf {
             out.push((Kind::H1, C::new(a, t), J * (0.5 * w)));
             out.push((Kind::H2, C::new(a, -t), -J * (0.5 * w)));
         }
     } else {
-        composite(a, a + 40.0 / h, 32, 8, Some(0.25 * k), &mut buf);
+        composite(a, a + 40.0 / h, 16, 8, Some(0.25 * k), &mut buf);
         for &(x, w) in &buf {
             out.push((Kind::J, C::new(x, 0.0), C::new(w, 0.0)));
         }
@@ -312,6 +312,14 @@ impl Table {
     }
 
     pub fn new_side(ground: RealGround, freq: f64, r_min: f64, r_max: f64, margin: f64, fixed: Option<(C, C)>, side: Side) -> Table {
+        Self::new_window(ground, freq, Window { r_min, r_max, theta_min: 0.0 }, margin, fixed, side)
+    }
+
+    /// A table covering only `win` (distances and the lowest angle above the
+    /// surface that the geometry produces), which is far cheaper for antennas well
+    /// above the ground.
+    pub fn new_window(ground: RealGround, freq: f64, win: Window, margin: f64, fixed: Option<(C, C)>, side: Side) -> Table {
+        let (r_min, r_max) = (win.r_min, win.r_max);
         let omega = 2.0 * PI * freq;
         let k = omega / C0;
         let eps = ground.eps_c(freq);
@@ -345,7 +353,11 @@ impl Table {
         if rs.len() < 4 {
             rs = (0..4).map(|i| r_min + (r_max - r_min) * i as f64 / 3.0).collect();
         }
-        let ts: Vec<f64> = (0..30).map(|i| (PI / 2.0) * (i as f64 / 29.0).powf(1.7)).collect();
+        // angles from the window's lowest (with margin) to straight up, clustered
+        // toward the low end where the field changes fastest
+        let t0 = (win.theta_min / margin.max(1.0) - 0.02).max(0.0);
+        let nt = ((30.0 * (PI / 2.0 - t0) / (PI / 2.0)).ceil() as usize).max(8);
+        let ts: Vec<f64> = (0..nt).map(|i| t0 + (PI / 2.0 - t0) * (i as f64 / (nt - 1) as f64).powf(1.7)).collect();
         // remainder after the quasi-static image; in the air gTM -> +Gamma0, in the
         // ground gTM -> -Gamma0.  `fixed` tabulates constant coefficients (testing).
         let g = if side == Side::Ground { -gamma0 } else { gamma0 };
@@ -382,6 +394,34 @@ impl Table {
         let back = (-J * self.n_self * k * r).exp() * (omega * k / r);
         let x = k * r;
         [0, 1, 2, 3, 4].map(|c| self.splines[c].eval(x, th) * back)
+    }
+}
+
+/// Anything that gives the remainder field at (rho, h, freq): one table, or a blend
+/// of the tables at two neighbouring frequencies.
+pub trait Eval: Send + Sync {
+    fn eval(&self, rho: f64, h: f64, freq: f64) -> [C; 5];
+}
+
+impl Eval for Table {
+    fn eval(&self, rho: f64, h: f64, freq: f64) -> [C; 5] {
+        Table::eval(self, rho, h, freq)
+    }
+}
+
+/// Linear blend (in log frequency) of the tables at the two frequency buckets around
+/// the solve frequency.  Each table freezes the ground's permittivity at its own
+/// frequency; blending makes that error second-order in the bucket width.
+pub struct Blend {
+    pub a: std::sync::Arc<Table>,
+    pub b: std::sync::Arc<Table>,
+    pub w: f64,
+}
+
+impl Eval for Blend {
+    fn eval(&self, rho: f64, h: f64, freq: f64) -> [C; 5] {
+        let (x, y) = (self.a.eval(rho, h, freq), self.b.eval(rho, h, freq));
+        [0, 1, 2, 3, 4].map(|i| x[i] * (1.0 - self.w) + y[i] * self.w)
     }
 }
 
@@ -460,12 +500,12 @@ fn galerkin(
 /// Galerkin integrals of a tabulated reflected field between all pairs of `segs`
 /// (all on the table's side): `K[i*n + j]` for segs[i] (test), segs[j] (source).
 /// Reciprocal, so only j >= i is evaluated.
-pub fn segment_integrals(table: &Table, m: &Mesh, n_q: usize, freq: f64) -> Vec<[[C; 2]; 2]> {
+pub fn segment_integrals(table: &dyn Eval, m: &Mesh, n_q: usize, freq: f64) -> Vec<[[C; 2]; 2]> {
     let all: Vec<usize> = (0..m.n_segments()).collect();
     segment_integrals_of(table, m, n_q, freq, &all)
 }
 
-pub fn segment_integrals_of(table: &Table, m: &Mesh, n_q: usize, freq: f64, segs: &[usize]) -> Vec<[[C; 2]; 2]> {
+pub fn segment_integrals_of(table: &dyn Eval, m: &Mesh, n_q: usize, freq: f64, segs: &[usize]) -> Vec<[[C; 2]; 2]> {
     let n = segs.len();
     let pts = quad_points(m, n_q, segs);
     let rows: Vec<Vec<[[C; 2]; 2]>> = (0..n)
@@ -488,6 +528,27 @@ pub fn segment_integrals_of(table: &Table, m: &Mesh, n_q: usize, freq: f64, segs
 }
 
 /// Range (R_min, R_max) of a remainder table for these points (all on one side).
+/// The part of (distance, angle) space a remainder table must cover.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Window {
+    pub r_min: f64,
+    pub r_max: f64,
+    /// lowest angle above the surface (radians) between a point and an image point
+    pub theta_min: f64,
+}
+
+pub fn window_of_points(pts: &[V3]) -> Result<Window, Error> {
+    let (r_min, r_max) = range_of_points(pts)?;
+    let dmin = pts.iter().map(|p| p[2].abs()).fold(f64::INFINITY, f64::min);
+    let span = |i: usize| {
+        let lo = pts.iter().map(|p| p[i]).fold(f64::INFINITY, f64::min);
+        let hi = pts.iter().map(|p| p[i]).fold(f64::NEG_INFINITY, f64::max);
+        hi - lo
+    };
+    let rho_max = (span(0).powi(2) + span(1).powi(2)).sqrt();
+    Ok(Window { r_min, r_max, theta_min: (2.0 * dmin).atan2(rho_max) })
+}
+
 pub fn range_of_points(pts: &[V3]) -> Result<(f64, f64), Error> {
     let dist = |p: &V3| p[2].abs();
     let zmin = pts.iter().map(dist).fold(f64::INFINITY, f64::min);
@@ -501,6 +562,12 @@ pub fn range_of_points(pts: &[V3]) -> Result<(f64, f64), Error> {
         hi - lo
     };
     Ok((2.0 * zmin, (span(0).powi(2) + span(1).powi(2) + (2.0 * zmax).powi(2)).sqrt()))
+}
+
+/// Ground-side quadrature points of buried wires (`n_q` per segment).
+pub fn ground_points(m: &Mesh, n_q: usize) -> Vec<V3> {
+    let gnd: Vec<usize> = (0..m.n_segments()).filter(|&s| m.medium[s] == crate::mesh::GROUND).collect();
+    quad_points(m, n_q, &gnd).into_iter().flatten().collect()
 }
 
 /// Air-side quadrature points of wires (`n_q` per segment) and surfaces.
@@ -530,7 +597,7 @@ fn axes(r: V3, s: V3) -> (f64, f64, f64) {
 
 /// Remainder (tabulated reflected field) between test triangle p and source
 /// triangle q: `K[i][j] = ∫p ∫q (r - v_i)·D·(r' - v_j)`.
-pub fn tri_tri_remainder(table: &Table, freq: f64, vp: &[V3; 3], ap: f64, vq: &[V3; 3], aq: f64) -> [[C; 3]; 3] {
+pub fn tri_tri_remainder(table: &dyn Eval, freq: f64, vp: &[V3; 3], ap: f64, vq: &[V3; 3], aq: f64) -> [[C; 3]; 3] {
     let (pp, pq) = (crate::surface::tri_points(vp), crate::surface::tri_points(vq));
     let mut k = [[C::new(0.0, 0.0); 3]; 3];
     for (r, (_, wr)) in pp.iter().zip(crate::surface::TRI7) {
@@ -550,7 +617,7 @@ pub fn tri_tri_remainder(table: &Table, freq: f64, vp: &[V3; 3], ap: f64, vq: &[
 
 /// Remainder between a test wire segment and source triangle q:
 /// `K[s][j] = ∫seg shape_s t·D·(r' - v_j)` (shape 0 rising, 1 falling).
-pub fn seg_tri_remainder(table: &Table, freq: f64, p0: V3, t: V3, len: f64, n_q: usize, vq: &[V3; 3], aq: f64) -> [[C; 3]; 2] {
+pub fn seg_tri_remainder(table: &dyn Eval, freq: f64, p0: V3, t: V3, len: f64, n_q: usize, vq: &[V3; 3], aq: f64) -> [[C; 3]; 2] {
     let (x, w) = gauss01(n_q);
     let pq = crate::surface::tri_points(vq);
     let mut k = [[C::new(0.0, 0.0); 3]; 2];
