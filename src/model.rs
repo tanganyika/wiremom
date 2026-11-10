@@ -82,11 +82,16 @@ pub struct Load {
 }
 
 /// Shared cache of Sommerfeld tables, for sweeps and repeated solves.  Cloning
-/// shares the cache; tables are built once per frequency bucket and geometry, and
-/// threads that need the same table wait for one builder.
+/// shares the cache.  Frequencies are grouped in logarithmic buckets of width
+/// `reuse` and one table serves a bucket.
+///
+/// The cache never makes a thread wait for another thread's build: waiting inside
+/// rayon work can deadlock (a waiting worker may pick up a nested job that needs
+/// the same table).  A miss simply builds the table; [`prepare`](Self::prepare)
+/// builds the tables a sweep needs up front, so its frequencies don't all miss at once.
 #[derive(Clone, Default)]
 pub struct TableCache {
-    inner: Arc<Mutex<Vec<(TableKey, Arc<OnceLock<Arc<Table>>>)>>>,
+    inner: Arc<Mutex<Vec<(TableKey, Arc<Table>)>>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -99,17 +104,10 @@ struct TableKey {
     r_max: u64,
 }
 
-impl TableCache {
-    const CAPACITY: usize = 32;
-
-    fn get(&self, g: RealGround, freq: f64, r_min: f64, r_max: f64, reuse: f64) -> Arc<Table> {
-        if reuse <= 0.0 {
-            return Arc::new(Table::new(g, freq, r_min, r_max, 1.0, None));
-        }
-        // frequencies are bucketed logarithmically; one table per bucket centre
+impl TableKey {
+    fn new(g: RealGround, freq: f64, r_min: f64, r_max: f64, reuse: f64) -> (TableKey, f64) {
         let step = (1.0 + reuse).ln();
         let bucket = (freq.ln() / step).round() as i64;
-        let f_b = (bucket as f64 * step).exp();
         let key = TableKey {
             eps_r: g.eps_r.to_bits(),
             sigma: g.sigma.to_bits(),
@@ -118,22 +116,67 @@ impl TableCache {
             r_min: r_min.to_bits(),
             r_max: r_max.to_bits(),
         };
-        let cell = {
-            let mut v = self.inner.lock().unwrap();
-            if let Some(i) = v.iter().position(|(k, _)| *k == key) {
-                let e = v.remove(i);
-                v.push(e.clone());
-                e.1
-            } else {
-                let cell = Arc::new(OnceLock::new());
-                v.push((key, cell.clone()));
-                if v.len() > Self::CAPACITY {
-                    v.remove(0);
-                }
-                cell
+        (key, (bucket as f64 * step).exp())
+    }
+}
+
+impl TableCache {
+    const CAPACITY: usize = 64;
+
+    fn lookup(&self, key: &TableKey) -> Option<Arc<Table>> {
+        let mut v = self.inner.lock().unwrap();
+        let i = v.iter().position(|(k, _)| k == key)?;
+        let e = v.remove(i);
+        v.push(e.clone());
+        Some(e.1)
+    }
+
+    fn insert(&self, key: TableKey, t: Arc<Table>) -> Arc<Table> {
+        let mut v = self.inner.lock().unwrap();
+        if let Some((_, existing)) = v.iter().find(|(k, _)| *k == key) {
+            return existing.clone(); // another thread finished first
+        }
+        v.push((key, t.clone()));
+        if v.len() > Self::CAPACITY {
+            v.remove(0);
+        }
+        t
+    }
+
+    fn get(&self, g: RealGround, freq: f64, r_min: f64, r_max: f64, reuse: f64) -> Arc<Table> {
+        if reuse <= 0.0 {
+            return Arc::new(Table::new(g, freq, r_min, r_max, 1.0, None));
+        }
+        let (key, f_b) = TableKey::new(g, freq, r_min, r_max, reuse);
+        if let Some(t) = self.lookup(&key) {
+            return t;
+        }
+        let t = Arc::new(Table::new(g, f_b, r_min, r_max, 1.0 + reuse, None));
+        self.insert(key, t)
+    }
+
+    /// Build (in parallel) every table that solving `model` at `freqs` will need.
+    pub fn prepare(&self, model: &Model, freqs: &[f64]) -> Result<(), Error> {
+        let Ground::Real(g) = model.ground else { return Ok(()) };
+        if model.ground_table_reuse <= 0.0 {
+            return Ok(());
+        }
+        let m = model.mesh()?;
+        let (r0, r1) = sommerfeld::table_range(&m, model.n_ground)?;
+        let mut need: Vec<(TableKey, f64)> = vec![];
+        for &f in freqs {
+            let (key, f_b) = TableKey::new(g, f, r0, r1, model.ground_table_reuse);
+            if !need.iter().any(|(k, _)| *k == key) && self.lookup(&key).is_none() {
+                need.push((key, f_b));
             }
-        };
-        cell.get_or_init(|| Arc::new(Table::new(g, f_b, r_min, r_max, 1.0 + reuse, None))).clone()
+        }
+        let reuse = model.ground_table_reuse;
+        let built: Vec<(TableKey, Arc<Table>)> =
+            need.into_par_iter().map(|(key, f_b)| (key, Arc::new(Table::new(g, f_b, r0, r1, 1.0 + reuse, None)))).collect();
+        for (key, t) in built {
+            self.insert(key, t);
+        }
+        Ok(())
     }
 }
 
@@ -357,6 +400,8 @@ impl Model {
 
     /// Solve at many frequencies in parallel (sharing Sommerfeld tables).
     pub fn sweep(&self, freqs: &[f64]) -> Vec<Result<Solution, Error>> {
+        // a failure here (e.g. wires under ground) is reported by every solve below
+        let _ = self.tables.prepare(self, freqs);
         freqs.par_iter().map(|&f| self.solve(f)).collect()
     }
 }

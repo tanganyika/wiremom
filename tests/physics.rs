@@ -287,3 +287,14 @@ fn current_elements_reproduce_the_far_field() {
     let (_, ep) = s.far_field(th, ph);
     assert!((e_ph - ep).norm() < 1e-9 * ep.norm());
 }
+
+#[test]
+fn concurrent_solves_sharing_a_cache_do_not_deadlock() {
+    // many parallel solves of the same model (same table bucket) from inside rayon,
+    // as an app's own parallel sweep does, without TableCache::prepare
+    use rayon::prelude::*;
+    let m = over(Ground::Real(RealGround::AVERAGE), 8.0, false);
+    let freqs: Vec<f64> = (0..48).map(|i| 14.0e6 + i as f64 * 1e3).collect();
+    let z: Vec<C> = freqs.par_iter().map(|&f| m.solve(f).unwrap().input_impedance()).collect();
+    assert!(z.iter().all(|z| z.re > 0.0));
+}
