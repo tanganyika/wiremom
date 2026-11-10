@@ -521,11 +521,21 @@ pub fn segment_integrals(table: &dyn Eval, m: &Mesh, n_q: usize, freq: f64) -> V
 pub fn segment_integrals_of(table: &dyn Eval, m: &Mesh, n_q: usize, freq: f64, segs: &[usize]) -> Vec<[[C; 2]; 2]> {
     let n = segs.len();
     let pts = quad_points(m, n_q, segs);
+    // the remainder is smooth on the scale of the distance, so well-separated pairs
+    // need only 2 points a segment (as in `cross_integrals`)
+    let n_far = n_q.min(2);
+    let pts_far = quad_points(m, n_far, segs);
+    let mid: Vec<V3> = segs.iter().map(|&s| along(m.p0[s], m.t[s], 0.5 * m.len[s])).collect();
     let rows: Vec<Vec<[[C; 2]; 2]>> = (0..n)
         .into_par_iter()
         .map(|i| {
             (i..n)
-                .map(|j| galerkin(m, segs[i], segs[j], &pts[i], &pts[j], n_q, |r, s, rho| table.eval(rho, r[2].abs() + s[2].abs(), freq)))
+                .map(|j| {
+                    let (p, q) = (segs[i], segs[j]);
+                    let near = norm(sub(mid[i], mid[j])) < 3.0 * (m.len[p] + m.len[q]);
+                    let (pp, pq, nq) = if near { (&pts[i], &pts[j], n_q) } else { (&pts_far[i], &pts_far[j], n_far) };
+                    galerkin(m, p, q, pp, pq, nq, |r, s, rho| table.eval(rho, r[2].abs() + s[2].abs(), freq))
+                })
                 .collect()
         })
         .collect();

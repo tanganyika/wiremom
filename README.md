@@ -199,7 +199,7 @@ the reference cases ever need to change.
 | | Solve | Pattern (5,000 directions) | 24-point sweep |
 |---|---|---|---|
 | Free space | 2 ms | 12 ms | 12 ms |
-| 15 m over average ground | 25 ms | 29 ms | 230 ms |
+| 15 m over average ground | 23 ms | 27 ms | 130 ms |
 
 A vertical with a ground rod and 8 buried radials (about 120 segments) solves in
 70 ms. With the air-to-ground couplings integrated directly it took 750 ms.
@@ -212,6 +212,10 @@ What keeps it fast:
   more for longer ones.
 - **Ground tables limited to the geometry:** they cover only the distances and
   angles the antenna produces.
+- **Fewer points for the ground remainder between distant segments:** 2 per
+  segment instead of 6 beyond about three segment lengths (the remainder is
+  smooth on the scale of the distance). This halves the fill for large models
+  over ground, with no change in the fourth decimal of impedance.
 - **Tabulated air-to-ground couplings** for buried wires: one table row per
   horizontal distance, with its Bessel functions shared across all heights and
   depths.
