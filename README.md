@@ -185,6 +185,41 @@ No Python is needed to build, run or test the crate. The prototype in `python/`
 is a frozen reference: `python/tools/make_reference.py` regenerates the JSON if
 the reference cases ever need to change.
 
+## Known limitations
+
+These are the weaker spots, with how far they have been checked.
+
+- **No independent reference for some features.** nec2c can't model wires in the
+  ground or thin plates, so those are validated by exact limits, closed forms,
+  energy conservation, symmetry and classic results instead:
+  - **Wires in the ground:** a transparent ground reproduces free space, and
+    Dwight's ground-rod formula matches within 0.7%. Not compared with NEC-4 or
+    measurements.
+  - **Wire-to-surface junctions:** the plate model converges as the mesh is
+    refined, to 39.9 Ω for a λ/4 monopole on a 1 λ plate, and energy is
+    conserved. An equivalent wire grid differs by up to ~8%, approaching the
+    plate result as the grid is refined. The exact junction impedance is not
+    confirmed independently.
+- **Point contacts into lossy ground** (a wire stopping on the surface with
+  nothing below it) carry no current into the ground. `Solution::warnings`
+  reports them; model a rod or radials instead.
+- **A wire end on a surface must be at a mesh vertex** to connect.
+  `Surface::plate_grid` lets you place grid lines through such points.
+- **Not supported:** surfaces in or touching lossy ground, curved surfaces
+  (other than as flat triangles), and NEC deck import/export (the application
+  using this crate does that).
+- **Speed:**
+  - air-to-ground couplings of buried wires are computed directly (about 1.4 s
+    per frequency for a vertical with 8 buried radials); tabulating them would
+    help;
+  - the matrix is dense, so memory grows as N² and the solve as N³ (about 2,000
+    unknowns take a few seconds);
+  - no frequency interpolation of the matrix yet.
+- **Thin-wire limits as usual:** segments much shorter than about two wire
+  diameters, or wires closer than a few radii, lose accuracy, as in NEC.
+- **Line loss** is given as dB/100 m at the solve frequency; there's no
+  frequency-dependent loss model or complex characteristic impedance.
+
 ## References
 
 - R. F. Harrington, *Field Computation by Moment Methods* (1968).
