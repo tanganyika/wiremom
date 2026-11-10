@@ -1,0 +1,12 @@
+[package]
+name = "wiremom"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+complex-bessel = "0.3.0"
+num-complex = "0.4"
+rayon = "1"
+
+[dev-dependencies]
+serde_json = "1.0.154"
