@@ -25,17 +25,18 @@ It is the engine behind the *wiremom* option in
 | Skin-effect loss (conductivity, relative permeability) and extra series L per metre (insulation) | ✅ |
 | Free space, perfect ground (wires may touch it), Sommerfeld real ground | ✅ |
 | Wires buried in or crossing lossy ground (radials, ground rods, buried counterpoises) | ✅ |
+| Conducting surfaces (triangular RWG patches, e.g. plates, reflectors, car bodies), coupled to wires, over any ground | ✅ |
+| Wire-to-surface junctions (a wire ending on a surface vertex feeds current into it) | ✅ |
 | Impedance, VSWR, gain (θ/φ parts), radiated power, efficiency, current distribution | ✅ |
 | Current elements for an external far-field code | ✅ |
 | Parallel frequency sweeps sharing Sommerfeld tables | ✅ |
 | NEC deck import/export | ⬜ roadmap |
-| Surface patches and wire-to-patch junctions | ⬜ roadmap |
 
 ## Usage
 
 ```rust
 use num_complex::Complex64 as C;
-use wiremom::{C0, Conductor, Ground, LoadKind, Model, RealGround, Wire};
+use wiremom::{C0, Conductor, Ground, LoadKind, Model, RealGround, Surface, Wire};
 
 let f = 14.2e6;
 let lam = C0 / f;
@@ -48,6 +49,12 @@ let sol = m.solve(f)?;
 println!("Z = {}, SWR {:.2}", sol.input_impedance(), sol.vswr(50.0));
 println!("gain at 30° elevation: {:.2} dBi", sol.gain_dbi(60f64.to_radians(), 0.0));
 let sweep = m.sweep(&[14.0e6, 14.1e6, 14.2e6, 14.3e6]);   // parallel
+
+// a quarter-wave monopole fed against a 1 m square plate (the wire's start is a
+// plate vertex, so it connects)
+let mut m = Model::new(vec![Wire::new([0.0, 0.0, 0.0], [0.0, 0.0, 0.25 * lam], 0.002, 12)], Ground::Free);
+m.surfaces.push(Surface::plate([-0.5, -0.5, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 10, 10));
+m.add_source(0, 0, C::new(1.0, 0.0));
 
 // a feed line: source on a short "feed wire" (wire 1), 0.3 λ of 75 Ω line to the dipole
 use wiremom::{Port, TwoPortKind};
@@ -99,13 +106,26 @@ this wire and the junction.
    above, without anything continuing below, carries no current into the ground:
    point contacts have a very high spreading resistance, so real installations
    use rods or radials. `Solution::warnings` reports such ends.
-4. **Networks.** Transmission lines and other two-ports join gaps, as in NEC.
+4. **Surfaces.** Plates are meshed into triangles. Each interior edge carries an
+   RWG function, and edges shared by more than two triangles (plates meeting at
+   a seam) get one per extra triangle. The 1/R part of the Green's function over
+   a source triangle is integrated analytically (the Wilton–Graglia potential
+   formulas), the smooth rest with a 7-point rule. The same formulas couple
+   wires to plates.
+
+   A wire ending at a surface vertex gets a **junction** function. Its wire half
+   carries the current to the vertex, and on the triangles around the vertex it
+   continues as `(r−v)/(Θ|r−v|²)·(1 − ((r−v)·n)²/h²)`: exactly 1 A leaving the
+   vertex, no normal current on any edge, bounded divergence. Its 1/|r−v|
+   singularity is resolved with subtriangles graded geometrically toward the
+   vertex. Images and the Sommerfeld remainder treat surfaces like wires.
+5. **Networks.** Transmission lines and other two-ports join gaps, as in NEC.
    The wire structure is solved once per port, for a unit voltage there, which
    gives its admittance seen from the ports. The networks' admittances are added,
    and the small port system is solved with the source voltages fixed. A source
    on a port drives the line and the wire in parallel, and a 0 V source is a short
    (for stubs).
-5. **Solve and far field.** Z I = V by parallel LU, then the far field is
+6. **Solve and far field.** Z I = V by parallel LU, then the far field is
    integrated over the currents, adding the image weighted by the Fresnel
    coefficients over real ground.
 
@@ -133,6 +153,17 @@ this wire and the junction.
     formula;
   - the matrix stays symmetric (1.8e-5) with wires on both sides;
   - buried radials: more radials raise a vertical's efficiency.
+- **Surfaces:**
+  - the analytic triangle integrals match brute force and a closed form;
+  - a lossless dipole or monopole with a plate radiates exactly its input power;
+  - the matrix stays symmetric (to 1e-6) with plates and junctions;
+  - a dipole over a plate agrees with an equivalent wire-grid plate (1% in
+    impedance, 0.2 dB in gain);
+  - plate meshes converge (90.55 → 90.27 → 90.22 Ω);
+  - a 2 λ plate approaches the infinite ground plane: within 0.4% in impedance
+    for a dipole, 5% for a monopole fed against it;
+  - a monopole fed against a 1 λ plate converges to 39.9 Ω (wire grids approach
+    this slowly from below).
 - **Transmission lines:** a λ/2 line repeats the antenna's impedance, a λ/4 line
   inverts it (Z0²/Z), and any length and velocity factor follows the textbook
   formula (to 1%). Shorted λ/4 and λ/8 stubs match theory. A 1 dB line takes 1 dB

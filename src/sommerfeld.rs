@@ -487,6 +487,89 @@ pub fn segment_integrals_of(table: &Table, m: &Mesh, n_q: usize, freq: f64, segs
     k
 }
 
+/// Range (R_min, R_max) of a remainder table for these points (all on one side).
+pub fn range_of_points(pts: &[V3]) -> Result<(f64, f64), Error> {
+    let dist = |p: &V3| p[2].abs();
+    let zmin = pts.iter().map(dist).fold(f64::INFINITY, f64::min);
+    let zmax = pts.iter().map(dist).fold(f64::NEG_INFINITY, f64::max);
+    if !(zmin > 0.0) {
+        return Err(Error::new("a wire or surface lies in the ground surface; move it slightly above or below z = 0"));
+    }
+    let span = |i: usize| {
+        let lo = pts.iter().map(|p| p[i]).fold(f64::INFINITY, f64::min);
+        let hi = pts.iter().map(|p| p[i]).fold(f64::NEG_INFINITY, f64::max);
+        hi - lo
+    };
+    Ok((2.0 * zmin, (span(0).powi(2) + span(1).powi(2) + (2.0 * zmax).powi(2)).sqrt()))
+}
+
+/// Air-side quadrature points of wires (`n_q` per segment) and surfaces.
+pub fn air_points(m: &Mesh, n_q: usize) -> Vec<V3> {
+    let air: Vec<usize> = (0..m.n_segments()).filter(|&s| m.medium[s] == crate::mesh::AIR).collect();
+    let mut pts: Vec<V3> = quad_points(m, n_q, &air).into_iter().flatten().collect();
+    for t in 0..m.surf.tris.len() {
+        pts.extend(crate::surface::tri_points(&m.surf.tri_verts(t)));
+    }
+    pts
+}
+
+/// a·D·b for a dyadic in local axes (rho from source to observer, phi, z).
+#[inline]
+fn contract(d: &[C; 5], a: V3, b: V3, cx: f64, cy: f64) -> C {
+    let (ar, af) = (a[0] * cx + a[1] * cy, -a[0] * cy + a[1] * cx);
+    let (br, bf) = (b[0] * cx + b[1] * cy, -b[0] * cy + b[1] * cx);
+    d[0] * (ar * br) + d[1] * (af * bf) + d[2] * (ar * b[2]) + d[3] * (a[2] * br) + d[4] * (a[2] * b[2])
+}
+
+#[inline]
+fn axes(r: V3, s: V3) -> (f64, f64, f64) {
+    let (dx, dy) = (r[0] - s[0], r[1] - s[1]);
+    let rho = (dx * dx + dy * dy).sqrt();
+    if rho > 1e-12 * (1.0 + rho) { (rho, dx / rho, dy / rho) } else { (rho, 1.0, 0.0) }
+}
+
+/// Remainder (tabulated reflected field) between test triangle p and source
+/// triangle q: `K[i][j] = ∫p ∫q (r - v_i)·D·(r' - v_j)`.
+pub fn tri_tri_remainder(table: &Table, freq: f64, vp: &[V3; 3], ap: f64, vq: &[V3; 3], aq: f64) -> [[C; 3]; 3] {
+    let (pp, pq) = (crate::surface::tri_points(vp), crate::surface::tri_points(vq));
+    let mut k = [[C::new(0.0, 0.0); 3]; 3];
+    for (r, (_, wr)) in pp.iter().zip(crate::surface::TRI7) {
+        for (s, (_, ws)) in pq.iter().zip(crate::surface::TRI7) {
+            let (rho, cx, cy) = axes(*r, *s);
+            let d = table.eval(rho, r[2] + s[2], freq);
+            let w = wr * ap * ws * aq;
+            for i in 0..3 {
+                for j in 0..3 {
+                    k[i][j] += contract(&d, sub(*r, vp[i]), sub(*s, vq[j]), cx, cy) * w;
+                }
+            }
+        }
+    }
+    k
+}
+
+/// Remainder between a test wire segment and source triangle q:
+/// `K[s][j] = ∫seg shape_s t·D·(r' - v_j)` (shape 0 rising, 1 falling).
+pub fn seg_tri_remainder(table: &Table, freq: f64, p0: V3, t: V3, len: f64, n_q: usize, vq: &[V3; 3], aq: f64) -> [[C; 3]; 2] {
+    let (x, w) = gauss01(n_q);
+    let pq = crate::surface::tri_points(vq);
+    let mut k = [[C::new(0.0, 0.0); 3]; 2];
+    for (&xi, &wi) in x.iter().zip(w) {
+        let r = along(p0, t, xi * len);
+        for (s, (_, ws)) in pq.iter().zip(crate::surface::TRI7) {
+            let (rho, cx, cy) = axes(r, *s);
+            let d = table.eval(rho, r[2] + s[2], freq);
+            let wt = wi * len * ws * aq;
+            for j in 0..3 {
+                let v = contract(&d, t, sub(*s, vq[j]), cx, cy) * wt;
+                k[0][j] += v * xi;
+                k[1][j] += v * (1.0 - xi);
+            }
+        }
+    }
+    k
+}
+
 /// Galerkin integrals of the transmitted remainder: `K[i*na + j]` for test segment
 /// below[i] (in the ground) and source segment above[j] (in the air).  Evaluated
 /// directly (no table): 6 Gauss points per segment for nearby pairs, 2 otherwise.

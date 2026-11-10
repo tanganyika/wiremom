@@ -13,6 +13,7 @@ use crate::lu;
 use crate::mesh::{self, AIR, Conductor, FALL, GROUND, Mesh, RISE, Surface, Wire};
 use crate::quad::gauss01;
 use crate::sommerfeld::{self, RealGround, Side, Table};
+use crate::surface;
 use crate::vec3::*;
 use crate::{C0, EPS0, ETA0, Error, MU0};
 use num_complex::Complex64 as C;
@@ -270,6 +271,8 @@ pub struct Model {
     pub tables: TableCache,
     /// Transmission lines and other two-ports between gaps.
     pub networks: Vec<TwoPort>,
+    /// Conducting surfaces (plates); currently not connected to wires.
+    pub surfaces: Vec<surface::Surface>,
 }
 
 impl Model {
@@ -286,6 +289,7 @@ impl Model {
             ground_table_reuse: 0.02,
             tables: TableCache::default(),
             networks: vec![],
+            surfaces: vec![],
         }
     }
 
@@ -311,7 +315,13 @@ impl Model {
             Ground::Perfect => Surface::Perfect,
             Ground::Real(_) => Surface::Interface,
         };
-        mesh::build(&self.wires, surface, self.merge_tol)
+        mesh::build_with(&self.wires, &self.surfaces, surface, self.merge_tol)
+    }
+
+    /// The air-side Sommerfeld table for this mesh (wires and surfaces).
+    fn air_table(&self, m: &Mesh, g: RealGround, freq: f64) -> Result<Arc<Table>, Error> {
+        let (r0, r1) = sommerfeld::range_of_points(&sommerfeld::air_points(m, self.n_ground))?;
+        Ok(self.tables.get(g, Side::Air, freq, r0, r1, self.ground_table_reuse))
     }
 
     /// Impedance matrix (row-major, n_unknowns²) for `mesh` at `freq` (Hz).
@@ -345,6 +355,9 @@ impl Model {
         let mut eps = C::new(1.0, 0.0);
         let mut g0 = zero;
         let (mut k_air, mut k_gnd, mut k_cross) = (None, None, None);
+        // the air-side table (built here unless `table` overrides it), also used by
+        // the surfaces
+        let mut air_owned: Option<Arc<Table>> = None;
         match self.ground {
             Ground::Free => {}
             Ground::Perfect => img_air = C::new(1.0, 0.0),
@@ -352,15 +365,12 @@ impl Model {
                 eps = g.eps_c(freq);
                 g0 = g.gamma0(freq);
                 img_air = if table.is_some() { zero } else { g0 };
+                if (!air.is_empty() || !m.surf.tris.is_empty()) && table.is_none() {
+                    air_owned = Some(self.air_table(m, g, freq)?);
+                }
                 if !air.is_empty() {
-                    k_air = Some(match table {
-                        Some(t) => sommerfeld::segment_integrals_of(t, m, self.n_ground, freq, &air),
-                        None => {
-                            let (r0, r1) = sommerfeld::table_range_of(m, self.n_ground, &air)?;
-                            let t = self.tables.get(g, Side::Air, freq, r0, r1, self.ground_table_reuse);
-                            sommerfeld::segment_integrals_of(&t, m, self.n_ground, freq, &air)
-                        }
-                    });
+                    let t = table.or(air_owned.as_deref()).unwrap();
+                    k_air = Some(sommerfeld::segment_integrals_of(t, m, self.n_ground, freq, &air));
                 }
                 if !gnd.is_empty() {
                     let (r0, r1) = sommerfeld::table_range_of(m, self.n_ground, &gnd)?;
@@ -432,7 +442,7 @@ impl Model {
             })
             .collect();
 
-        let nb = m.n_unknowns();
+        let nb = m.basis.len();
         let mut z = vec![C::new(0.0, 0.0); nb * nb];
         z.par_chunks_mut(nb).enumerate().for_each(|(mi, row)| {
             for ha in &m.basis[mi].halves {
@@ -487,7 +497,284 @@ impl Model {
                 }
             }
         }
+        self.add_surfaces(m, z, freq, img_air, table.or(air_owned.as_deref()))
+    }
+
+    /// Extend the wire matrix with the surfaces' RWG unknowns: plate–plate and
+    /// wire–plate interactions, their ground images and the real-ground remainder.
+    fn add_surfaces(&self, m: &Mesh, zw: Vec<C>, freq: f64, img: C, table: Option<&Table>) -> Result<Vec<C>, Error> {
+        let sm = &m.surf;
+        let nw = m.basis.len();
+        let ns = sm.rwg.len();
+        if ns == 0 && m.junctions.is_empty() {
+            return Ok(zw);
+        }
+        let n = nw + ns;
+        let omega = 2.0 * PI * freq;
+        let k = C::new(omega / C0, 0.0);
+        let jwmu = C::new(0.0, omega * MU0);
+        let inv_jweps = C::new(0.0, -1.0 / (omega * EPS0));
+        let zero = C::new(0.0, 0.0);
+        let nt = sm.tris.len();
+        let verts: Vec<[V3; 3]> = (0..nt).map(|t| sm.tri_verts(t)).collect();
+        let iverts: Vec<[V3; 3]> = verts.iter().map(|v| v.map(reflect)).collect();
+        let real = matches!(self.ground, Ground::Real(_));
+        // triangle-pair integrals, combined with the image (-img x reflected source)
+        // and minus the remainder (Z = -<f, D f>)
+        let tt: Vec<Vec<([[C; 3]; 3], C)>> = (0..nt)
+            .into_par_iter()
+            .map(|p| {
+                (0..nt)
+                    .map(|q| {
+                        let f = surface::tri_pair(&verts[p], sm.area[p], &verts[q], sm.area[q], k);
+                        let mut a = f.a.map(|r| r.map(|x| jwmu * x));
+                        let mut s = inv_jweps * f.s;
+                        if img != zero {
+                            let fi = surface::tri_pair(&verts[p], sm.area[p], &iverts[q], sm.area[q], k);
+                            for i in 0..3 {
+                                for j in 0..3 {
+                                    a[i][j] -= img * jwmu * fi.a[i][j];
+                                }
+                            }
+                            s -= img * inv_jweps * fi.s;
+                        }
+                        if let (true, Some(t)) = (real, table) {
+                            let kr = sommerfeld::tri_tri_remainder(t, freq, &verts[p], sm.area[p], &verts[q], sm.area[q]);
+                            for i in 0..3 {
+                                for j in 0..3 {
+                                    a[i][j] -= kr[i][j];
+                                }
+                            }
+                        }
+                        (a, s)
+                    })
+                    .collect()
+            })
+            .collect();
+        // wire segment (test) - triangle (source) integrals, likewise
+        let nseg = m.n_segments();
+        let wt: Vec<Vec<([[C; 3]; 2], C)>> = (0..nseg)
+            .into_par_iter()
+            .map(|p| {
+                (0..nt)
+                    .map(|q| {
+                        let f = surface::wire_tri(m.p0[p], m.t[p], m.len[p], &verts[q], sm.area[q], k, self.n_outer);
+                        let mut a = f.a.map(|r| r.map(|x| jwmu * x));
+                        let mut s = inv_jweps * f.s;
+                        if img != zero {
+                            let fi = surface::wire_tri(m.p0[p], m.t[p], m.len[p], &iverts[q], sm.area[q], k, self.n_outer);
+                            for i in 0..2 {
+                                for j in 0..3 {
+                                    a[i][j] -= img * jwmu * fi.a[i][j];
+                                }
+                            }
+                            s -= img * inv_jweps * fi.s;
+                        }
+                        if let (true, Some(t)) = (real, table) {
+                            let kr = sommerfeld::seg_tri_remainder(t, freq, m.p0[p], m.t[p], m.len[p], self.n_ground, &verts[q], sm.area[q]);
+                            for i in 0..2 {
+                                for j in 0..3 {
+                                    a[i][j] -= kr[i][j];
+                                }
+                            }
+                        }
+                        (a, s)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // RWG half: (triangle, free vertex, sign * l/(2A)) and its divergence sign * l/A
+        let coef = |h: &surface::RwgHalf, len: f64| (h.sign * len / (2.0 * sm.area[h.tri]), h.sign * len / sm.area[h.tri]);
+        let mut z = vec![zero; n * n];
+        for i in 0..nw {
+            z[i * n..i * n + nw].copy_from_slice(&zw[i * nw..(i + 1) * nw]);
+        }
+        // surface rows: plate-plate and plate-wire (by reciprocity, = wire-plate)
+        let rows: Vec<Vec<C>> = (0..ns)
+            .into_par_iter()
+            .map(|mi| {
+                let bm = &sm.rwg[mi];
+                let mut row = vec![zero; n];
+                for hm in &bm.halves {
+                    let (fm, dm) = coef(hm, bm.len);
+                    for (ni, bn) in sm.rwg.iter().enumerate() {
+                        let mut acc = zero;
+                        for hn in &bn.halves {
+                            let (fn_, dn) = coef(hn, bn.len);
+                            let (a, s) = &tt[hm.tri][hn.tri];
+                            acc += a[hm.free][hn.free] * (fm * fn_) + s * (dm * dn);
+                        }
+                        row[nw + ni] += acc;
+                    }
+                    for (wi, bw) in m.basis.iter().enumerate() {
+                        let mut acc = zero;
+                        for hw in &bw.halves {
+                            let (a, s) = &wt[hw.seg][hm.tri];
+                            let dw = hw.div / m.len[hw.seg];
+                            acc += a[hw.shape][hm.free] * (hw.c * fm) + s * (dw * dm);
+                        }
+                        row[wi] += acc;
+                    }
+                }
+                row
+            })
+            .collect();
+        for (mi, row) in rows.into_iter().enumerate() {
+            let r = nw + mi;
+            z[r * n..(r + 1) * n].copy_from_slice(&row);
+            for wi in 0..nw {
+                z[wi * n + r] = row[wi];
+            }
+        }
+        if !m.junctions.is_empty() {
+            self.add_junctions(m, &mut z, n, freq, img, table, &verts, &iverts);
+        }
         Ok(z)
+    }
+
+    /// Wire-to-surface junctions: each junction basis (a wire half, already in the
+    /// matrix) continues as a surface part S_J around its vertex.  Adds ⟨S_J, L y⟩ to
+    /// row and column J for every unknown y, and ⟨S_J, L S_K⟩ between junctions.
+    #[allow(clippy::too_many_arguments)]
+    fn add_junctions(&self, m: &Mesh, z: &mut [C], n: usize, freq: f64, img: C, table: Option<&Table>, verts: &[[V3; 3]], iverts: &[[V3; 3]]) {
+        let sm = &m.surf;
+        let nw = m.basis.len();
+        let omega = 2.0 * PI * freq;
+        let k = C::new(omega / C0, 0.0);
+        let jwmu = C::new(0.0, omega * MU0);
+        let inv_jweps = C::new(0.0, -1.0 / (omega * EPS0));
+        let zero = C::new(0.0, 0.0);
+        let real = matches!(self.ground, Ground::Real(_));
+        let parts: Vec<Vec<surface::Sub>> = m.junctions.iter().map(|&(_, v)| surface::junction_part(sm, v)).collect();
+        let segs: Vec<kernel::Seg> = (0..m.n_segments()).map(|s| kernel::Seg { p0: m.p0[s], t: m.t[s], len: m.len[s], radius: m.radius[s] }).collect();
+        let isegs: Vec<kernel::Seg> = segs.iter().map(|g| kernel::Seg { p0: reflect(g.p0), t: reflect(g.t), ..*g }).collect();
+        let nseg = segs.len();
+        // quadrature samples of every unknown for the real-ground remainder:
+        // (point, current-density weight vector)
+        let samples: Vec<Vec<(V3, V3)>> = if real {
+            let (x, w) = gauss01(self.n_ground);
+            let mut out: Vec<Vec<(V3, V3)>> = m
+                .basis
+                .iter()
+                .map(|b| {
+                    b.halves
+                        .iter()
+                        .flat_map(|h| {
+                            let sh = |xi: f64| if h.shape == RISE { xi } else { 1.0 - xi };
+                            x.iter().zip(w).map(move |(&xi, &wi)| (along(m.p0[h.seg], m.t[h.seg], xi * m.len[h.seg]), scale(m.t[h.seg], h.c * sh(xi) * wi * m.len[h.seg])))
+                        })
+                        .collect()
+                })
+                .collect();
+            for b in &sm.rwg {
+                let mut v = vec![];
+                for h in &b.halves {
+                    let f = h.sign * b.len / (2.0 * sm.area[h.tri]);
+                    for (r, (_, w)) in surface::tri_points(&verts[h.tri]).iter().zip(surface::TRI7) {
+                        v.push((*r, scale(sub(*r, verts[h.tri][h.free]), f * w * sm.area[h.tri])));
+                    }
+                }
+                out.push(v);
+            }
+            out
+        } else {
+            vec![]
+        };
+        let remainder = |r: V3, a: V3, pts: &[(V3, V3)]| -> C {
+            let t = table.unwrap();
+            pts.iter()
+                .map(|(s, b)| {
+                    let (dx, dy) = (r[0] - s[0], r[1] - s[1]);
+                    let rho = (dx * dx + dy * dy).sqrt();
+                    let (cx, cy) = if rho > 1e-12 * (1.0 + rho) { (dx / rho, dy / rho) } else { (1.0, 0.0) };
+                    let d = t.eval(rho, r[2] + s[2], freq);
+                    let (ar, af) = (a[0] * cx + a[1] * cy, -a[0] * cy + a[1] * cx);
+                    let (br, bf) = (b[0] * cx + b[1] * cy, -b[0] * cy + b[1] * cx);
+                    d[0] * (ar * br) + d[1] * (af * bf) + d[2] * (ar * b[2]) + d[3] * (a[2] * br) + d[4] * (a[2] * b[2])
+                })
+                .sum()
+        };
+        let pf = |v: V3| [v[0], v[1], -v[2]];
+        for (ji, (&(jb, _), subs)) in m.junctions.iter().zip(&parts).enumerate() {
+            // test points of S_J: (point, weight, f, div)
+            let tests: Vec<(V3, f64, V3, f64)> = subs.iter().flat_map(|s| s.points().map(|(r, w)| (r, w, s.f, s.div))).collect();
+            let g: Vec<C> = tests
+                .par_iter()
+                .map(|&(r, w, f, dv)| {
+                    let mut g = vec![zero; n];
+                    // wire unknowns
+                    let lg: Vec<((C, C), (C, C))> = (0..nseg)
+                        .map(|q| {
+                            let fr = kernel::line_green(r, &segs[q], segs[q].radius, k, self.n_inner);
+                            let im = if img != zero { kernel::line_green(r, &isegs[q], segs[q].radius, k, self.n_inner) } else { (zero, zero) };
+                            (fr, im)
+                        })
+                        .collect();
+                    for (yi, b) in m.basis.iter().enumerate() {
+                        let mut acc = zero;
+                        for h in &b.halves {
+                            let ((s0, s1), (s0i, s1i)) = lg[h.seg];
+                            let (sh, shi) = if h.shape == RISE { (s1, s1i) } else { (s0 - s1, s0i - s1i) };
+                            let (ft, fti) = (dot(f, segs[h.seg].t), dot(f, isegs[h.seg].t));
+                            acc += jwmu * h.c * (ft * sh - img * fti * shi) + inv_jweps * (h.div / m.len[h.seg]) * dv * (s0 - img * s0i);
+                        }
+                        g[yi] = acc;
+                    }
+                    // RWG unknowns
+                    let tg: Vec<((C, [C; 3]), (C, [C; 3]))> = (0..sm.tris.len())
+                        .map(|q| {
+                            let fr = surface::green_integrals(r, &verts[q], sm.area[q], k);
+                            let im = if img != zero { surface::green_integrals(r, &iverts[q], sm.area[q], k) } else { (zero, [zero; 3]) };
+                            (fr, im)
+                        })
+                        .collect();
+                    for (bi, b) in sm.rwg.iter().enumerate() {
+                        let mut acc = zero;
+                        for h in &b.halves {
+                            let ((s0, sv), (s0i, svi)) = tg[h.tri];
+                            let (fc, dc) = (h.sign * b.len / (2.0 * sm.area[h.tri]), h.sign * b.len / sm.area[h.tri]);
+                            let (d, di) = (sub(r, verts[h.tri][h.free]), sub(r, pf(verts[h.tri][h.free])));
+                            let vec: C = (0..3).map(|i| f[i] * (sv[i] + d[i] * s0)).sum();
+                            let veci: C = (0..3).map(|i| f[i] * (svi[i] + di[i] * s0i)).sum();
+                            acc += jwmu * fc * (vec - img * veci) + inv_jweps * dc * dv * (s0 - img * s0i);
+                        }
+                        g[nw + bi] = acc;
+                    }
+                    if real {
+                        for (yi, pts) in samples.iter().enumerate() {
+                            g[yi] -= remainder(r, f, pts);
+                        }
+                    }
+                    g.into_iter().map(|x| x * w).collect::<Vec<C>>()
+                })
+                .reduce(|| vec![zero; n], |a, b| a.iter().zip(&b).map(|(x, y)| x + y).collect());
+            for y in 0..n {
+                z[jb * n + y] += g[y];
+                z[y * n + jb] += g[y];
+            }
+            // surface part against every junction's surface part
+            for (ki, (&(kb, _), ksubs)) in m.junctions.iter().zip(&parts).enumerate() {
+                let ksamp: Vec<(V3, V3)> = ksubs.iter().map(|s| (s.centroid(), scale(s.f, s.area))).collect();
+                let h: C = tests
+                    .par_iter()
+                    .map(|&(r, w, f, dv)| {
+                        let mut acc = zero;
+                        for s in ksubs {
+                            let (s0, _) = surface::green_integrals(r, &s.v, s.area, k);
+                            let (s0i, _) = if img != zero { surface::green_integrals(r, &s.v.map(pf), s.area, k) } else { (zero, [zero; 3]) };
+                            acc += jwmu * (dot(f, s.f) * s0 - img * dot(f, pf(s.f)) * s0i) + inv_jweps * dv * s.div * (s0 - img * s0i);
+                        }
+                        if real {
+                            acc -= remainder(r, f, &ksamp);
+                        }
+                        acc * w
+                    })
+                    .sum();
+                let _ = (ji, ki);
+                z[jb * n + kb] += h;
+            }
+        }
     }
 
     /// Solve at `freq` (Hz).
@@ -714,6 +1001,44 @@ impl Solution {
                 out.push((along(m.p0[s], m.t[s], xi * m.len[s]), [mom * m.t[s][0], mom * m.t[s][1], mom * m.t[s][2]]));
             }
         }
+        // surfaces: the 7-point rule on every triangle
+        out.extend(self.surface_elements());
+        out
+    }
+
+    /// Surface current elements: (point, J·dA) at the 7-point rule of each triangle.
+    pub fn surface_elements(&self) -> Vec<(V3, [C; 3])> {
+        let m = &self.mesh;
+        let sm = &m.surf;
+        let nw = m.basis.len();
+        let mut on_tri: Vec<Vec<(usize, &surface::RwgHalf, f64)>> = vec![vec![]; sm.tris.len()];
+        for (bi, b) in sm.rwg.iter().enumerate() {
+            for h in &b.halves {
+                on_tri[h.tri].push((bi, h, b.len));
+            }
+        }
+        let mut out = Vec::with_capacity(sm.tris.len() * 7);
+        for (t, list) in on_tri.iter().enumerate() {
+            let v = sm.tri_verts(t);
+            for (r, (_, w)) in surface::tri_points(&v).iter().zip(surface::TRI7) {
+                let mut j = [C::new(0.0, 0.0); 3];
+                for &(bi, h, len) in list {
+                    let f = h.sign * len / (2.0 * sm.area[t]);
+                    let d = sub(*r, v[h.free]);
+                    for i in 0..3 {
+                        j[i] += self.currents[nw + bi] * (f * d[i]);
+                    }
+                }
+                out.push((*r, j.map(|x| x * (w * sm.area[t]))));
+            }
+        }
+        // junction surface parts
+        for &(jb, v) in &m.junctions {
+            for sb in surface::junction_part(sm, v) {
+                let a = self.currents[jb] * sb.area;
+                out.push((sb.centroid(), sb.f.map(|x| a * x)));
+            }
+        }
         out
     }
 
@@ -727,7 +1052,8 @@ impl Solution {
         let (els, med) = self.elements.get_or_init(|| {
             let e = self.current_elements(6);
             let m = &self.mesh;
-            let med = (0..m.n_segments()).flat_map(|s| std::iter::repeat_n(m.medium[s], 6)).collect();
+            let mut med: Vec<u8> = (0..m.n_segments()).flat_map(|s| std::iter::repeat_n(m.medium[s], 6)).collect();
+            med.resize(e.len(), AIR); // surfaces are always in the air
             (e, med)
         });
         if self.ground != Ground::Free && theta > PI / 2.0 + 1e-12 {

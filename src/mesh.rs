@@ -13,6 +13,7 @@
 //! at its node.
 
 use crate::Error;
+use crate::surface::SurfMesh;
 use crate::vec3::*;
 use std::collections::HashMap;
 
@@ -101,6 +102,12 @@ pub struct Mesh {
     pub medium: Vec<u8>,
     /// Notes about the geometry (e.g. wire ends left unconnected at ground level).
     pub warnings: Vec<String>,
+    /// Conducting surfaces (triangles with RWG functions); their unknowns follow
+    /// the wires' in the system.
+    pub surf: SurfMesh,
+    /// Wire-to-surface junctions: (wire basis with the wire's half, surface vertex).
+    /// The basis continues onto the surface around the vertex.
+    pub junctions: Vec<(usize, usize)>,
 }
 
 pub const AIR: u8 = 0;
@@ -121,6 +128,11 @@ pub enum Surface {
 /// Build the mesh.  `merge_tol` (m) joins segment ends; `None` uses the same rule as
 /// most wire codes: 1e-4 of the shortest segment, at least 1e-7 m.
 pub fn build(wires: &[Wire], surface: Surface, merge_tol: Option<f64>) -> Result<Mesh, Error> {
+    build_with(wires, &[], surface, merge_tol)
+}
+
+/// As [`build`], with conducting surfaces.
+pub fn build_with(wires: &[Wire], surfaces: &[crate::surface::Surface], surface: Surface, merge_tol: Option<f64>) -> Result<Mesh, Error> {
     let ground_plane = surface == Surface::Perfect;
     let mut m = Mesh {
         p0: vec![],
@@ -136,6 +148,8 @@ pub fn build(wires: &[Wire], surface: Surface, merge_tol: Option<f64>) -> Result
         ground_plane,
         medium: vec![],
         warnings: vec![],
+        surf: SurfMesh::default(),
+        junctions: vec![],
     };
     for (wi, w) in wires.iter().enumerate() {
         let total = w.length();
@@ -222,7 +236,19 @@ pub fn build(wires: &[Wire], surface: Surface, merge_tol: Option<f64>) -> Result
         }
     }
 
+    if !surfaces.is_empty() {
+        m.surf = SurfMesh::build(surfaces, tol)?;
+    }
+    let surf_vertex = |p: V3| m.surf.verts.iter().position(|v| norm(sub(*v, p)) <= tol);
     for (n, ends) in ends_at.iter().enumerate() {
+        if let Some(vi) = surf_vertex(m.nodes[n]) {
+            // wire ends on a surface vertex: each end's current flows into the surface
+            for &(s, e) in ends {
+                m.junctions.push((m.basis.len(), vi));
+                m.basis.push(Basis { node: n, halves: vec![half(s, e, true)] });
+            }
+            continue;
+        }
         if ground_plane && m.nodes[n][2].abs() <= tol {
             for &(s, e) in ends {
                 // current flows up out of the ground into the segment
@@ -242,6 +268,16 @@ pub fn build(wires: &[Wire], surface: Surface, merge_tol: Option<f64>) -> Result
         let (sa, ea) = ends[0];
         for &(sb, eb) in &ends[1..] {
             m.basis.push(Basis { node: n, halves: vec![half(sa, ea, true), half(sb, eb, false)] });
+        }
+    }
+    if !surfaces.is_empty() {
+        let zmin = m.surf.verts.iter().map(|v| v[2]).fold(f64::INFINITY, f64::min);
+        match surface {
+            Surface::Perfect if zmin < -tol => return Err(Error::new("with a ground plane every surface must be at z >= 0")),
+            Surface::Interface if zmin <= tol => {
+                return Err(Error::new("over real ground, surfaces must be above the ground (z > 0); surfaces in the ground are not supported"));
+            }
+            _ => {}
         }
     }
     if m.basis.is_empty() {
@@ -304,7 +340,7 @@ impl Mesh {
         self.len.len()
     }
     pub fn n_unknowns(&self) -> usize {
-        self.basis.len()
+        self.basis.len() + self.surf.rwg.len()
     }
     /// Number of nodes along wire `w` (segments + 1); node 0 is the wire's start.
     pub fn wire_nodes(&self, w: usize) -> usize {

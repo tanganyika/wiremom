@@ -76,3 +76,29 @@ pub fn expm1(z: C) -> C {
     let h = z * 0.5;
     2.0 * h.sinh() * h.exp()
 }
+
+/// `(∫ G du', ∫ (u'/L) G du')` along a source segment, seen from point `r`, with
+/// the reduced kernel of radius `a` (analytic 1/R part, Gauss for the rest).
+pub fn line_green(r: V3, src: &Seg, a: f64, k: C, n: usize) -> (C, C) {
+    let (xi, wi) = gauss01(n);
+    let a2 = a * a;
+    let lq = src.len;
+    let four_pi = 4.0 * PI;
+    let rel = sub(r, src.p0);
+    let z0 = dot(rel, src.t);
+    let d2 = dot(rel, rel) - z0 * z0 + a2;
+    let d = d2.max(1e-300).sqrt();
+    let i0 = ((lq - z0) / d).asinh() + (z0 / d).asinh();
+    let i1 = ((lq - z0) * (lq - z0) + d2).sqrt() - (z0 * z0 + d2).sqrt() + z0 * i0;
+    let mut s0 = C::new(i0 / four_pi, 0.0);
+    let mut s1 = C::new(i1 / (lq * four_pi), 0.0);
+    for (&xs, &ws) in xi.iter().zip(wi) {
+        let q = along(src.p0, src.t, xs * lq);
+        let dd = sub(r, q);
+        let rr = (dot(dd, dd) + a2).sqrt();
+        let f = expm1(C::new(0.0, -1.0) * k * rr) / (four_pi * rr);
+        s0 += f * (lq * ws);
+        s1 += f * (lq * ws * xs);
+    }
+    (s0, s1)
+}

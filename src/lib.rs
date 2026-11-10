@@ -22,7 +22,7 @@
 //! Matrix fill, LU, Sommerfeld tables and sweeps run in parallel on rayon.
 
 // `!(x > 0.0)` deliberately also rejects NaN; index loops mirror the formulas.
-#![allow(clippy::neg_cmp_op_on_partial_ord, clippy::needless_range_loop)]
+#![allow(clippy::neg_cmp_op_on_partial_ord, clippy::needless_range_loop, clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod kernel;
 pub mod lu;
@@ -31,11 +31,13 @@ pub mod model;
 pub mod quad;
 pub mod sommerfeld;
 pub mod spline;
+pub mod surface;
 pub mod vec3;
 
 pub use mesh::{Conductor, Mesh, Segments, Wire};
 pub use model::{Gain, Ground, Load, LoadKind, Model, Port, Solution, Source, TableCache, TwoPort, TwoPortKind};
 pub use sommerfeld::RealGround;
+pub use surface::Surface;
 
 pub const C0: f64 = 299_792_458.0;
 pub const MU0: f64 = 4.0e-7 * std::f64::consts::PI;
