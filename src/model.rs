@@ -8,6 +8,7 @@
 //!
 //! and Z I = V with V the delta-gap voltages.
 
+use crate::farground::SecondGround;
 use crate::kernel::{self, PairIntegrals};
 use crate::lu;
 use crate::mesh::{self, AIR, Conductor, FALL, GROUND, Mesh, RISE, Surface, Wire};
@@ -300,6 +301,9 @@ pub struct Model {
     /// Interpolate the air-to-ground couplings of buried wires from a table
     /// (default) instead of integrating each one directly (slow; for checking).
     pub tabulate_cross: bool,
+    /// A second ground medium beyond a boundary (sea, marsh), for the far field
+    /// only; needs a perfect or real primary ground.  See [`SecondGround`].
+    pub second_ground: Option<SecondGround>,
     pub tables: TableCache,
     /// Transmission lines and other two-ports between gaps.
     pub networks: Vec<TwoPort>,
@@ -321,6 +325,7 @@ impl Model {
             merge_tol: None,
             ground_table_reuse: 0.04,
             tabulate_cross: true,
+            second_ground: None,
             tables: TableCache::default(),
             networks: vec![],
             surfaces: vec![],
@@ -861,6 +866,7 @@ impl Model {
             sources: self.sources.clone(),
             src_current,
             ground: self.ground,
+            second_ground: if self.ground == Ground::Free { None } else { self.second_ground },
             elements: OnceLock::new(),
             t_fill_ms,
             t_solve_ms,
@@ -982,6 +988,8 @@ pub struct Solution {
     /// current each source delivers (into its gap, and any networks on it)
     src_current: Vec<C>,
     pub ground: Ground,
+    /// second ground medium for the far field (see [`Model::second_ground`])
+    pub second_ground: Option<SecondGround>,
     /// far-field current elements (6 Gauss points per segment) and their media,
     /// built on first use
     elements: OnceLock<(Vec<(V3, [C; 3])>, Vec<u8>)>,
@@ -1143,6 +1151,10 @@ impl Solution {
         };
         let mut nd = [C::new(0.0, 0.0); 3];
         let mut ni = [C::new(0.0, 0.0); 3];
+        // second medium: images weighted per element by each medium's share of its
+        // reflection (`ni` then holds medium 1's, `ni2` medium 2's)
+        let mut ni2 = [C::new(0.0, 0.0); 3];
+        let ray = self.second_ground.map(|_| crate::farground::Ray::new(PI / 2.0 - theta.min(PI / 2.0), phi, k));
         let (mut et_b, mut ep_b) = (C::new(0.0, 0.0), C::new(0.0, 0.0));
         for ((p, c), &md) in els.iter().zip(med) {
             if md == GROUND {
@@ -1170,26 +1182,38 @@ impl Solution {
             {
                 // image current -P J at the mirror point
                 let ph_i = ph_h * ph_v.conj();
-                ni[0] -= c[0] * ph_i;
-                ni[1] -= c[1] * ph_i;
-                ni[2] += c[2] * ph_i;
+                let (w1, w2) = match (&self.second_ground, &ray) {
+                    (Some(sg), Some(r)) => sg.weights(*p, r),
+                    _ => (C::new(1.0, 0.0), C::new(0.0, 0.0)),
+                };
+                let (a, b) = (ph_i * w1, ph_i * w2);
+                ni[0] -= c[0] * a;
+                ni[1] -= c[1] * a;
+                ni[2] += c[2] * a;
+                ni2[0] -= c[0] * b;
+                ni2[1] -= c[1] * b;
+                ni2[2] += c[2] * b;
             }
         }
         let pref = C::new(0.0, -2.0 * PI * self.freq * MU0 / (4.0 * PI));
         let proj = |v: &[C; 3], u: V3| v[0] * u[0] + v[1] * u[1] + v[2] * u[2];
         let mut e_th = pref * proj(&nd, th);
         let mut e_ph = pref * proj(&nd, ph);
-        match self.ground {
-            Ground::Free => {}
-            Ground::Perfect => {
-                e_th += pref * proj(&ni, th);
-                e_ph += pref * proj(&ni, ph);
-            }
-            Ground::Real(g) => {
-                let (g_te, g_tm) = g.reflection(self.freq, theta.min(PI / 2.0));
-                e_th += g_tm * pref * proj(&ni, th) + pref * et_b;
-                e_ph += -g_te * pref * proj(&ni, ph) + pref * ep_b;
-            }
+        // reflection coefficients (gTE, gTM) of the primary ground; a perfect
+        // conductor is (-1, 1)
+        let (g_te, g_tm) = match self.ground {
+            Ground::Free => return (e_th, e_ph),
+            Ground::Perfect => (C::new(-1.0, 0.0), C::new(1.0, 0.0)),
+            Ground::Real(g) => g.reflection(self.freq, theta.min(PI / 2.0)),
+        };
+        e_th += g_tm * pref * proj(&ni, th) + pref * et_b;
+        e_ph += -g_te * pref * proj(&ni, ph) + pref * ep_b;
+        if let Some(sg) = &self.second_ground {
+            // medium 2's surface is `drop` lower: its image is 2 drop further down
+            let (t2, m2) = sg.ground.reflection(self.freq, theta.min(PI / 2.0));
+            let shift = C::from_polar(1.0, -2.0 * k * sg.drop * ct);
+            e_th += m2 * shift * pref * proj(&ni2, th);
+            e_ph += -t2 * shift * pref * proj(&ni2, ph);
         }
         (e_th, e_ph)
     }

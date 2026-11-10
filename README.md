@@ -25,6 +25,7 @@ It is the engine behind the *wiremom* option in
 | Skin-effect loss (conductivity, relative permeability) and extra series L per metre (insulation) | ✅ |
 | Free space, perfect ground (wires may touch it), Sommerfeld real ground | ✅ |
 | Wires buried in or crossing lossy ground (radials, ground rods, buried counterpoises) | ✅ |
+| A second ground medium for the far field (sea beyond a shore, a marsh, a cliff drop), straight or circular boundary, as NEC-2's GD card, with a Fresnel-zone transition | ✅ |
 | Conducting surfaces (triangular RWG patches, e.g. plates, reflectors, car bodies), coupled to wires, over any ground | ✅ |
 | Wire-to-surface junctions (a wire ending on a surface vertex feeds current into it) | ✅ |
 | Impedance, VSWR, gain (θ/φ parts), radiated power, efficiency, current distribution | ✅ |
@@ -128,6 +129,19 @@ this wire and the junction.
 6. **Solve and far field.** Z I = V by parallel LU, then the far field is
    integrated over the currents, adding the image weighted by the Fresnel
    coefficients over real ground.
+7. **Second ground medium** (`Model::second_ground`). As NEC-2's GD card, it
+   changes only the reflection in the far field; the currents are solved over
+   the ground under the antenna. Medium 2 lies beyond a straight line (any
+   bearing) or outside a circle, optionally lower by a drop (a cliff). NEC-2
+   takes the medium at each ray's specular point, which makes the pattern jump
+   where that point crosses the shore. By default wiremom shares the reflection
+   between the media with the physical-optics integral across the edge (a
+   complex Fresnel integral of the edge's distance from the specular point in
+   Fresnel-zone units), per current element. This gives a smooth transition
+   while the shore is inside the first Fresnel zone, and NEC-2's switch far from
+   it. Low rays from low antennas have zones hundreds of metres long, so a shore
+   well beyond the specular point still matters. `fresnel = false` gives NEC-2's
+   behaviour.
 
 ## Validation
 
@@ -185,7 +199,12 @@ this wire and the junction.
   - sources at wire joints; phased sources;
   - real-ground limits: the perfect-conductor limit, the null at the horizon,
     efficiency below 1;
-  - sweep table sharing; current elements vs. the built-in far field.
+  - sweep table sharing; current elements vs. the built-in far field;
+  - second ground medium: NEC-2 mode matches nec2c's linear cliff (GD card,
+    with and without a 5 m drop, horizontal and vertical dipoles) within
+    0.1 dB away from the transition angles; a distant boundary changes nothing;
+    radius 0 gives medium 2 everywhere; the Fresnel transition is continuous and
+    matches NEC-2 far from the shore.
 
 No Python is needed to build, run or test the crate. The prototype in `python/`
 is a frozen reference: `python/tools/make_reference.py` regenerates the JSON if
@@ -246,6 +265,10 @@ These are the weaker spots, with how far they have been checked.
   reports them; model a rod or radials instead.
 - **A wire end on a surface must be at a mesh vertex** to connect.
   `Surface::plate_grid` lets you place grid lines through such points.
+- **Second ground medium:** far field only, as in NEC-2. The currents (and so
+  the impedance) see only the ground under the antenna. The cliff face itself
+  doesn't reflect or diffract. Circles smaller than the Fresnel zone are
+  approximate (treated as their tangent line).
 - **Not supported:** surfaces in or touching lossy ground, curved surfaces
   (other than as flat triangles), and NEC deck import/export (the application
   using this crate does that).

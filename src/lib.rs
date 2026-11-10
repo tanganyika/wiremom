@@ -24,6 +24,7 @@
 // `!(x > 0.0)` deliberately also rejects NaN; index loops mirror the formulas.
 #![allow(clippy::neg_cmp_op_on_partial_ord, clippy::needless_range_loop, clippy::too_many_arguments, clippy::type_complexity)]
 
+pub mod farground;
 pub mod kernel;
 pub mod lu;
 pub mod mesh;
@@ -36,6 +37,7 @@ pub mod vec3;
 
 pub use mesh::{Conductor, Mesh, Segments, Wire};
 pub use model::{Gain, Ground, Load, LoadKind, Model, Port, Solution, Source, TableCache, TwoPort, TwoPortKind};
+pub use farground::{Boundary, SecondGround};
 pub use sommerfeld::RealGround;
 pub use surface::Surface;
 
