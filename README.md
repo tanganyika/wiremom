@@ -21,6 +21,7 @@ It is the engine behind the *wiremom* option in
 | Equal or arbitrary segment lengths per wire (e.g. MMANA-style tapers) | ✅ |
 | Voltage sources with phase, at interior nodes, wire joints, junctions, ground connections | ✅ |
 | Lumped loads: series/parallel RLC, fixed impedances, open circuits | ✅ |
+| Transmission lines (Z0, length, velocity factor, loss, crossed, end shunts) and general two-ports between gaps, NEC TL/NT semantics | ✅ |
 | Skin-effect loss (conductivity, relative permeability) and extra series L per metre (insulation) | ✅ |
 | Free space, perfect ground (wires may touch it), Sommerfeld real ground | ✅ |
 | Wires buried in or crossing lossy ground (radials, ground rods, buried counterpoises) | ✅ |
@@ -28,7 +29,6 @@ It is the engine behind the *wiremom* option in
 | Current elements for an external far-field code | ✅ |
 | Parallel frequency sweeps sharing Sommerfeld tables | ✅ |
 | NEC deck import/export | ⬜ roadmap |
-| Transmission-line and network elements | ⬜ roadmap |
 | Surface patches and wire-to-patch junctions | ⬜ roadmap |
 
 ## Usage
@@ -48,6 +48,15 @@ let sol = m.solve(f)?;
 println!("Z = {}, SWR {:.2}", sol.input_impedance(), sol.vswr(50.0));
 println!("gain at 30° elevation: {:.2} dBi", sol.gain_dbi(60f64.to_radians(), 0.0));
 let sweep = m.sweep(&[14.0e6, 14.1e6, 14.2e6, 14.3e6]);   // parallel
+
+// a feed line: source on a short "feed wire" (wire 1), 0.3 λ of 75 Ω line to the dipole
+use wiremom::{Port, TwoPortKind};
+let mut m = Model::new(vec![
+    Wire::new([0.0, -0.24 * lam, 10.0], [0.0, 0.24 * lam, 10.0], 0.001, 40),
+    Wire::new([0.0, 0.0, 30.0], [0.0, 0.0, 30.05], 0.001, 2),
+], Ground::Free);
+m.add_source(1, 1, C::new(1.0, 0.0));
+m.add_network(Port { wire: 1, node: 1 }, Port { wire: 0, node: 20 }, TwoPortKind::line(75.0, Some(0.3 * lam)));
 # Ok::<(), wiremom::Error>(())
 ```
 
@@ -90,7 +99,13 @@ this wire and the junction.
    above, without anything continuing below, carries no current into the ground:
    point contacts have a very high spreading resistance, so real installations
    use rods or radials. `Solution::warnings` reports such ends.
-4. **Solve and far field.** Z I = V by parallel LU, then the far field is
+4. **Networks.** Transmission lines and other two-ports join gaps, as in NEC.
+   The wire structure is solved once per port, for a unit voltage there, which
+   gives its admittance seen from the ports. The networks' admittances are added,
+   and the small port system is solved with the source voltages fixed. A source
+   on a port drives the line and the wire in parallel, and a 0 V source is a short
+   (for stubs).
+5. **Solve and far field.** Z I = V by parallel LU, then the far field is
    integrated over the currents, adding the image weighted by the Fresnel
    coefficients over real ground.
 
@@ -118,6 +133,11 @@ this wire and the junction.
     formula;
   - the matrix stays symmetric (1.8e-5) with wires on both sides;
   - buried radials: more radials raise a vertical's efficiency.
+- **Transmission lines:** a λ/2 line repeats the antenna's impedance, a λ/4 line
+  inverts it (Z0²/Z), and any length and velocity factor follows the textbook
+  formula (to 1%). Shorted λ/4 and λ/8 stubs match theory. A 1 dB line takes 1 dB
+  of efficiency. A crossed line flips a pair of dipoles from broadside to
+  end-fire. The `TL` card of nec2c agrees within 2.3%.
 - **Physics checks:**
   - dipole impedance and 2.15 dBi gain;
   - convergence with segmentation; tapered vs. uniform segmentation;

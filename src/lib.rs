@@ -34,7 +34,7 @@ pub mod spline;
 pub mod vec3;
 
 pub use mesh::{Conductor, Mesh, Segments, Wire};
-pub use model::{Gain, Ground, Load, LoadKind, Model, Solution, Source, TableCache};
+pub use model::{Gain, Ground, Load, LoadKind, Model, Port, Solution, Source, TableCache, TwoPort, TwoPortKind};
 pub use sommerfeld::RealGround;
 
 pub const C0: f64 = 299_792_458.0;

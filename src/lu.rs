@@ -5,49 +5,76 @@ use rayon::prelude::*;
 
 /// Solve A x = b in place (A row-major n x n, destroyed; b becomes x).
 pub fn solve(a: &mut [C], b: &mut [C], n: usize) -> Result<(), String> {
-    assert_eq!(a.len(), n * n);
-    assert_eq!(b.len(), n);
-    for k in 0..n {
-        // pivot
-        let (p, best) = (k..n).map(|i| (i, a[i * n + k].norm())).fold((k, -1.0), |m, x| if x.1 > m.1 { x } else { m });
-        if !(best > 0.0) || !best.is_finite() {
-            return Err("singular impedance matrix (check the geometry for overlapping wires)".into());
-        }
-        if p != k {
-            for j in 0..n {
-                a.swap(k * n + j, p * n + j);
-            }
-            b.swap(k, p);
-        }
-        let (top, rest) = a.split_at_mut((k + 1) * n);
-        let pivot_row = &top[k * n..(k + 1) * n];
-        let inv = 1.0 / pivot_row[k];
-        let bk = b[k];
-        let (_, b_rest) = b.split_at_mut(k + 1);
-        let update = |(row, bi): (&mut [C], &mut C)| {
-            let f = row[k] * inv;
-            if f != C::new(0.0, 0.0) {
-                row[k] = f;
-                for j in k + 1..n {
-                    row[j] -= f * pivot_row[j];
-                }
-                *bi -= f * bk;
-            }
-        };
-        if (n - k) * (n - k) > 64 * 64 {
-            rest.par_chunks_mut(n).zip(b_rest.par_iter_mut()).for_each(update);
-        } else {
-            rest.chunks_mut(n).zip(b_rest.iter_mut()).for_each(update);
-        }
-    }
-    for k in (0..n).rev() {
-        let mut s = b[k];
-        for j in k + 1..n {
-            s -= a[k * n + j] * b[j];
-        }
-        b[k] = s / a[k * n + k];
-    }
+    let lu = Lu::factor(a.to_vec(), n)?;
+    lu.solve(b);
     Ok(())
+}
+
+/// LU factorisation with partial pivoting, for solving several right-hand sides.
+pub struct Lu {
+    a: Vec<C>,
+    piv: Vec<usize>,
+    n: usize,
+}
+
+impl Lu {
+    /// Factor A (row-major n x n).  The trailing update runs on rayon.
+    pub fn factor(mut a: Vec<C>, n: usize) -> Result<Lu, String> {
+        assert_eq!(a.len(), n * n);
+        let mut piv = vec![0; n];
+        for k in 0..n {
+            let (p, best) = (k..n).map(|i| (i, a[i * n + k].norm())).fold((k, -1.0), |m, x| if x.1 > m.1 { x } else { m });
+            if !(best > 0.0) || !best.is_finite() {
+                return Err("singular impedance matrix (check the geometry for overlapping wires)".into());
+            }
+            piv[k] = p;
+            if p != k {
+                for j in 0..n {
+                    a.swap(k * n + j, p * n + j);
+                }
+            }
+            let (top, rest) = a.split_at_mut((k + 1) * n);
+            let pivot_row = &top[k * n..(k + 1) * n];
+            let inv = 1.0 / pivot_row[k];
+            let update = |row: &mut [C]| {
+                let f = row[k] * inv;
+                row[k] = f;
+                if f != C::new(0.0, 0.0) {
+                    for j in k + 1..n {
+                        row[j] -= f * pivot_row[j];
+                    }
+                }
+            };
+            if (n - k) * (n - k) > 64 * 64 {
+                rest.par_chunks_mut(n).for_each(update);
+            } else {
+                rest.chunks_mut(n).for_each(update);
+            }
+        }
+        Ok(Lu { a, piv, n })
+    }
+
+    /// Solve in place for one right-hand side.
+    pub fn solve(&self, b: &mut [C]) {
+        let (a, n) = (&self.a, self.n);
+        for k in 0..n {
+            b.swap(k, self.piv[k]);
+        }
+        for i in 1..n {
+            let mut s = b[i];
+            for j in 0..i {
+                s -= a[i * n + j] * b[j];
+            }
+            b[i] = s;
+        }
+        for k in (0..n).rev() {
+            let mut s = b[k];
+            for j in k + 1..n {
+                s -= a[k * n + j] * b[j];
+            }
+            b[k] = s / a[k * n + k];
+        }
+    }
 }
 
 #[cfg(test)]

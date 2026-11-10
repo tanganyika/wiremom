@@ -81,6 +81,66 @@ pub struct Load {
     pub kind: LoadKind,
 }
 
+/// A network port: the gap at `node` of wire `wire` (see [`Mesh::gap`]); its "+"
+/// side is toward the wire's end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Port {
+    pub wire: usize,
+    pub node: usize,
+}
+
+/// A non-radiating two-port connected between two gaps, as NEC's TL and NT cards.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TwoPortKind {
+    /// Transmission line.  `length` None = the straight distance between the ports;
+    /// `crossed` reverses the conductors at the second port (NEC's negative Z0);
+    /// `shunt` admittances (S) sit across each end.
+    Line { z0: f64, length: Option<f64>, velocity_factor: f64, loss_db_per_100m: f64, crossed: bool, shunt: [C; 2] },
+    /// General network by its short-circuit admittance parameters (S).
+    Admittance { y11: C, y12: C, y22: C },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TwoPort {
+    pub a: Port,
+    pub b: Port,
+    pub kind: TwoPortKind,
+}
+
+impl TwoPortKind {
+    /// A lossless line with velocity factor 1 and no shunts.
+    pub fn line(z0: f64, length: Option<f64>) -> TwoPortKind {
+        TwoPortKind::Line { z0, length, velocity_factor: 1.0, loss_db_per_100m: 0.0, crossed: false, shunt: [C::new(0.0, 0.0); 2] }
+    }
+
+    /// Short-circuit admittance matrix (y11, y12, y22) at angular frequency `omega`,
+    /// with port currents flowing into the network; `dist` is the port spacing.
+    pub fn admittance(&self, omega: f64, dist: f64) -> Result<(C, C, C), Error> {
+        match *self {
+            TwoPortKind::Admittance { y11, y12, y22 } => Ok((y11, y12, y22)),
+            TwoPortKind::Line { z0, length, velocity_factor, loss_db_per_100m, crossed, shunt } => {
+                let l = length.unwrap_or(dist);
+                if !(l > 0.0) || !(z0.abs() > 0.0) || !(velocity_factor > 0.0) {
+                    return Err(Error::new("a transmission line needs a length, impedance and velocity factor above zero"));
+                }
+                let alpha = loss_db_per_100m.max(0.0) * std::f64::consts::LN_10 / 20.0 / 100.0;
+                let beta = omega / (velocity_factor * C0);
+                // a lossless line a whole number of half wavelengths long has no
+                // admittance matrix (sinh(γl) = 0); 1e-9 Np of loss keeps it finite
+                // and leaves the results accurate to ~1e-7
+                let gl = C::new((alpha * l).max(1e-9), beta * l);
+                let (sh, ch) = (gl.sinh(), gl.cosh());
+                let y11 = ch / sh / z0;
+                let mut y12 = -1.0 / (sh * z0);
+                if crossed {
+                    y12 = -y12;
+                }
+                Ok((y11 + shunt[0], y12, y11 + shunt[1]))
+            }
+        }
+    }
+}
+
 /// Shared cache of Sommerfeld tables, for sweeps and repeated solves.  Cloning
 /// shares the cache.  Frequencies are grouped in logarithmic buckets of width
 /// `reuse` and one table serves a bucket.
@@ -208,6 +268,8 @@ pub struct Model {
     /// it for every frequency.  Reuse within ±1% costs ~0.1% in impedance.
     pub ground_table_reuse: f64,
     pub tables: TableCache,
+    /// Transmission lines and other two-ports between gaps.
+    pub networks: Vec<TwoPort>,
 }
 
 impl Model {
@@ -223,11 +285,20 @@ impl Model {
             merge_tol: None,
             ground_table_reuse: 0.02,
             tables: TableCache::default(),
+            networks: vec![],
         }
     }
 
     pub fn add_source(&mut self, wire: usize, node: usize, voltage: C) {
         self.sources.push(Source { wire, node, voltage });
+    }
+
+    /// Connect a two-port (e.g. [`TwoPortKind::line`]) between two gaps.  A source on
+    /// one of its ports drives the network and the wire in parallel (as in NEC), so a
+    /// short "feed wire" with a source and a line to the antenna models a feed line;
+    /// a 0 V source is a short circuit (e.g. a shorted stub).
+    pub fn add_network(&mut self, a: Port, b: Port, kind: TwoPortKind) {
+        self.networks.push(TwoPort { a, b, kind });
     }
 
     pub fn add_load(&mut self, wire: usize, node: usize, kind: LoadKind) {
@@ -426,33 +497,129 @@ impl Model {
         }
         let t0 = Instant::now();
         let m = Arc::new(self.mesh()?);
-        let mut z = self.impedance_matrix(&m, freq)?;
+        let z = self.impedance_matrix(&m, freq)?;
         let t1 = Instant::now();
         let nb = m.n_unknowns();
-        let mut v = vec![C::new(0.0, 0.0); nb];
-        let mut gaps = vec![];
-        for s in &self.sources {
-            let g = m.gap(s.wire, s.node)?;
-            for &(b, sign) in &g {
-                v[b] += s.voltage * sign;
+        let lu = lu::Lu::factor(z, nb).map_err(Error::new)?;
+        let (currents, src_current) = if self.networks.is_empty() {
+            // every port is a source: superpose directly
+            let mut v = vec![C::new(0.0, 0.0); nb];
+            let mut gaps = vec![];
+            for s in &self.sources {
+                let g = m.gap(s.wire, s.node)?;
+                for &(b, sign) in &g {
+                    v[b] += s.voltage * sign;
+                }
+                gaps.push(g);
             }
-            gaps.push(g);
-        }
-        lu::solve(&mut z, &mut v, nb).map_err(Error::new)?;
+            lu.solve(&mut v);
+            let ic = gaps.iter().map(|g| g.iter().map(|&(b, s)| v[b] * s).sum()).collect();
+            (v, ic)
+        } else {
+            self.solve_ports(&m, &lu, freq)?
+        };
         let t_fill_ms = (t1 - t0).as_secs_f64() * 1e3;
         let t_solve_ms = t1.elapsed().as_secs_f64() * 1e3;
         Ok(Solution {
             warnings: m.warnings.clone(),
             mesh: m,
             freq,
-            currents: v,
+            currents,
             sources: self.sources.clone(),
-            gaps,
+            src_current,
             ground: self.ground,
             elements: OnceLock::new(),
             t_fill_ms,
             t_solve_ms,
         })
+    }
+
+    /// Port analysis for networks: the wire structure's admittance seen from every
+    /// port (one solve per port), plus the networks' admittances, gives the port
+    /// equations (Y_wire + Y_net) V = I_source.  Source ports have known V; the
+    /// others carry no external current.  Returns basis currents and the current each
+    /// source delivers (into the wire and the networks at its port).
+    fn solve_ports(&self, m: &Mesh, lu: &lu::Lu, freq: f64) -> Result<(Vec<C>, Vec<C>), Error> {
+        let omega = 2.0 * PI * freq;
+        let nb = m.n_unknowns();
+        let mut ports: Vec<Port> = vec![];
+        let index = |p: Port, ports: &mut Vec<Port>| match ports.iter().position(|q| *q == p) {
+            Some(i) => i,
+            None => {
+                ports.push(p);
+                ports.len() - 1
+            }
+        };
+        let src_port: Vec<usize> = self.sources.iter().map(|s| index(Port { wire: s.wire, node: s.node }, &mut ports)).collect();
+        let net_ports: Vec<(usize, usize)> = self.networks.iter().map(|n| (index(n.a, &mut ports), index(n.b, &mut ports))).collect();
+        let np = ports.len();
+        let gaps: Vec<Vec<(usize, f64)>> = ports.iter().map(|p| m.gap(p.wire, p.node)).collect::<Result<_, _>>()?;
+        // unit-voltage solutions, in parallel
+        let x: Vec<Vec<C>> = gaps
+            .par_iter()
+            .map(|g| {
+                let mut v = vec![C::new(0.0, 0.0); nb];
+                for &(b, s) in g {
+                    v[b] += s;
+                }
+                lu.solve(&mut v);
+                v
+            })
+            .collect();
+        let mut y = vec![C::new(0.0, 0.0); np * np];
+        for h in 0..np {
+            for g in 0..np {
+                y[h * np + g] = gaps[h].iter().map(|&(b, s)| x[g][b] * s).sum();
+            }
+        }
+        let node_pos = |p: &Port| -> V3 {
+            let segs = &m.wire_segs[p.wire];
+            if p.node == 0 { m.p0[segs[0]] } else { m.p1[segs[p.node - 1]] }
+        };
+        for (n, &(a, b)) in self.networks.iter().zip(&net_ports) {
+            let dist = norm(sub(node_pos(&n.a), node_pos(&n.b)));
+            let (y11, y12, y22) = n.kind.admittance(omega, dist)?;
+            y[a * np + a] += y11;
+            y[a * np + b] += y12;
+            y[b * np + a] += y12;
+            y[b * np + b] += y22;
+        }
+        // known port voltages from the sources
+        let mut v = vec![C::new(0.0, 0.0); np];
+        let mut known = vec![false; np];
+        for (s, &p) in self.sources.iter().zip(&src_port) {
+            if known[p] {
+                return Err(Error::new("two sources share one gap"));
+            }
+            known[p] = true;
+            v[p] = s.voltage;
+        }
+        let unk: Vec<usize> = (0..np).filter(|&i| !known[i]).collect();
+        if !unk.is_empty() {
+            let nu = unk.len();
+            let mut a = vec![C::new(0.0, 0.0); nu * nu];
+            let mut r = vec![C::new(0.0, 0.0); nu];
+            for (i, &pi) in unk.iter().enumerate() {
+                for (j, &pj) in unk.iter().enumerate() {
+                    a[i * nu + j] = y[pi * np + pj];
+                }
+                r[i] = -(0..np).filter(|&k| known[k]).map(|k| y[pi * np + k] * v[k]).sum::<C>();
+            }
+            lu::solve(&mut a, &mut r, nu).map_err(|_| Error::new("the network has no solution (e.g. a line of exactly half a wavelength between two open ends)"))?;
+            for (i, &pi) in unk.iter().enumerate() {
+                v[pi] = r[i];
+            }
+        }
+        let mut currents = vec![C::new(0.0, 0.0); nb];
+        for (g, vg) in v.iter().enumerate() {
+            if *vg != C::new(0.0, 0.0) {
+                for (c, xg) in currents.iter_mut().zip(&x[g]) {
+                    *c += vg * xg;
+                }
+            }
+        }
+        let src_current = src_port.iter().map(|&p| (0..np).map(|g| y[p * np + g] * v[g]).sum()).collect();
+        Ok((currents, src_current))
     }
 
     /// Solve at many frequencies in parallel (sharing Sommerfeld tables).
@@ -479,7 +646,8 @@ pub struct Solution {
     /// Basis coefficients = node currents (A).
     pub currents: Vec<C>,
     pub sources: Vec<Source>,
-    gaps: Vec<Vec<(usize, f64)>>,
+    /// current each source delivers (into its gap, and any networks on it)
+    src_current: Vec<C>,
     pub ground: Ground,
     /// far-field current elements (6 Gauss points per segment) and their media,
     /// built on first use
@@ -492,9 +660,10 @@ pub struct Solution {
 }
 
 impl Solution {
-    /// Current through each source's gap (along its wire).
+    /// Current each source delivers: through its gap along the wire, plus into any
+    /// network connected at the same gap.
     pub fn source_currents(&self) -> Vec<C> {
-        self.gaps.iter().map(|g| g.iter().map(|&(b, s)| self.currents[b] * s).sum()).collect()
+        self.src_current.clone()
     }
     /// Impedance at every source (ohms).
     pub fn source_impedances(&self) -> Vec<C> {
