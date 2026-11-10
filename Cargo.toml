@@ -2,6 +2,12 @@
 name = "wiremom"
 version = "0.1.0"
 edition = "2024"
+description = "Thin-wire method-of-moments antenna solver: MPIE with Galerkin triangle basis functions, perfect and Sommerfeld real ground"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tanganyika/wiremom"
+readme = "README.md"
+keywords = ["antenna", "electromagnetics", "method-of-moments", "nec", "sommerfeld"]
+categories = ["science", "simulation"]
 
 [dependencies]
 complex-bessel = "0.3.0"

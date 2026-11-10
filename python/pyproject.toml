@@ -3,6 +3,7 @@ name = "wiremom"
 version = "0.1.0"
 description = "Open-source thin-wire method-of-moments antenna solver (MPIE formulation, Sommerfeld ground)"
 readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "scipy>=1.10"]
 
