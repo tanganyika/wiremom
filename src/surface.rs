@@ -30,10 +30,20 @@ impl Surface {
     /// n1 x n2 cells of two triangles each.
     pub fn plate(corner: V3, edge1: V3, edge2: V3, n1: usize, n2: usize) -> Surface {
         let (n1, n2) = (n1.max(1), n2.max(1));
+        let us: Vec<f64> = (0..=n1).map(|i| i as f64 / n1 as f64).collect();
+        let vs: Vec<f64> = (0..=n2).map(|j| j as f64 / n2 as f64).collect();
+        Self::plate_grid(corner, edge1, edge2, &us, &vs)
+    }
+
+    /// A parallelogram plate with grid lines at the given fractions along each edge
+    /// (each list ascending from 0 to 1).  Put a line through a point where a wire
+    /// ends on the plate to give the wire a vertex to connect to.
+    pub fn plate_grid(corner: V3, edge1: V3, edge2: V3, us: &[f64], vs: &[f64]) -> Surface {
+        let (n1, n2) = (us.len() - 1, vs.len() - 1);
         let mut vertices = vec![];
-        for j in 0..=n2 {
-            for i in 0..=n1 {
-                vertices.push(add(corner, add(scale(edge1, i as f64 / n1 as f64), scale(edge2, j as f64 / n2 as f64))));
+        for &v in vs {
+            for &u in us {
+                vertices.push(add(corner, add(scale(edge1, u), scale(edge2, v))));
             }
         }
         let id = |i: usize, j: usize| j * (n1 + 1) + i;
@@ -460,5 +470,12 @@ mod tests {
         let corner = m.verts.iter().position(|v| norm(sub(*v, [-0.5, -0.5, 0.0])) < 1e-12).unwrap();
         let charge: f64 = junction_part(&m, corner).iter().map(|s| s.div * s.area).sum();
         assert!((charge + 1.0).abs() < 0.02, "{charge}");
+    }
+
+    #[test]
+    fn plate_grid_puts_a_vertex_where_asked() {
+        let p = Surface::plate_grid([0.0; 3], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0], &[0.0, 0.3, 0.65, 1.0], &[0.0, 0.5, 1.0]);
+        assert!(p.vertices.iter().any(|v| norm(sub(*v, [0.3, 1.0, 0.0])) < 1e-12));
+        assert_eq!(p.triangles.len(), 3 * 2 * 2);
     }
 }
