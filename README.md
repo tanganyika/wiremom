@@ -217,8 +217,8 @@ the reference cases ever need to change.
 
 | | Solve | Pattern (5,000 directions) | 24-point sweep |
 |---|---|---|---|
-| Free space | 2 ms | 12 ms | 12 ms |
-| 15 m over average ground | 23 ms | 27 ms | 130 ms |
+| Free space | 1.3 ms | 14 ms | 9 ms |
+| 15 m over average ground | 23 ms | 30 ms | 106 ms |
 
 A vertical with a ground rod and 8 buried radials (about 120 segments) solves in
 70 ms. With the air-to-ground couplings integrated directly it took 750 ms.
@@ -231,6 +231,11 @@ What keeps it fast:
   more for longer ones.
 - **Ground tables limited to the geometry:** they cover only the distances and
   angles the antenna produces.
+- **Blocked LU:** panels of 64 columns, with the trailing update in cache-sized
+  tiles (as LAPACK's getrf), about 37 GFLOP/s on 6 cores: 1,350 unknowns factor
+  in 0.17 s (0.71 s unblocked), 2,000 in 0.47 s (`--example lubench`).
+- **Reciprocity:** distant segment pairs are integrated once and transposed;
+  near pairs, where the quadrature isn't exactly symmetric, both ways.
 - **Fewer points for the ground remainder between distant segments:** 2 per
   segment instead of 6 beyond about three segment lengths (the remainder is
   smooth on the scale of the distance). This halves the fill for large models
@@ -276,8 +281,9 @@ These are the weaker spots, with how far they have been checked.
   - buried-wire tables are rebuilt for every frequency of a sweep (not
     blended), and strongly conducting grounds such as sea water need finer
     tables (about 0.3 s for 16 radials);
-  - the matrix is dense, so memory grows as N² and the solve as N³ (about 2,000
-    unknowns take a few seconds);
+  - the matrix is dense, so memory grows as N² and the solve as N³. A
+    1,350-unknown radial system lying in the soil takes about 0.9 s per
+    frequency (0.75 s fill, 0.17 s LU);
   - no frequency interpolation of the matrix yet.
 - **Thin-wire limits as usual:** segments much shorter than about two wire
   diameters, or wires closer than a few radii, lose accuracy, as in NEC.

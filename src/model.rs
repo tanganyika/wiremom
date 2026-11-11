@@ -429,12 +429,20 @@ impl Model {
 
         // per segment pair: vector-potential block v[a][b] and scalar term s
         let seg = |s: usize| kernel::Seg { p0: m.p0[s], t: m.t[s], len: m.len[s], radius: m.radius[s] };
-        let pairs: Vec<Vec<([[C; 2]; 2], C)>> = (0..n)
+        // Every term is reciprocal: (q, p) is (p, q) with the shapes swapped.  Near
+        // pairs are integrated both ways (the quadrature isn't exactly symmetric
+        // there); distant ones once, and transposed below.
+        let n_max = self.n_outer.max(self.n_inner);
+        let near = |p: usize, q: usize| !self.adaptive || kernel::order(&seg(p), &seg(q), n_max) >= n_max;
+        let mut pairs: Vec<Vec<([[C; 2]; 2], C)>> = (0..n)
             .into_par_iter()
             .map(|p| {
                 let sp = seg(p);
                 (0..n)
                     .map(|q| {
+                        if q < p && !near(p, q) {
+                            return ([[zero; 2]; 2], zero);
+                        }
                         let sq = seg(q);
                         let tt = dot(m.t[p], m.t[q]);
                         let (mp, mq) = (m.medium[p], m.medium[q]);
@@ -492,6 +500,15 @@ impl Model {
                     .collect()
             })
             .collect();
+        for p in 1..n {
+            let (lo, hi) = pairs.split_at_mut(p);
+            for q in 0..p {
+                if !near(p, q) {
+                    let (v, s) = lo[q][p];
+                    hi[0][q] = ([[v[0][0], v[1][0]], [v[0][1], v[1][1]]], s);
+                }
+            }
+        }
 
         let nb = m.basis.len();
         let mut z = vec![C::new(0.0, 0.0); nb * nb];

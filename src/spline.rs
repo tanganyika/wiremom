@@ -123,6 +123,65 @@ impl Spline2 {
     }
 }
 
+/// Bicubic interpolation of `nc` complex components sharing one grid (one cell
+/// search and one set of weights for all of them).
+pub struct Spline2N {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    nc: usize,
+    /// per grid point: [f, fx, fy, fxy] x nc
+    d: Vec<C>,
+}
+
+impl Spline2N {
+    /// `values[(i * ny + j) * nc + c]` is component c at (x[i], y[j]).
+    pub fn new(x: Vec<f64>, y: Vec<f64>, nc: usize, values: &[C]) -> Spline2N {
+        let (nx, ny) = (x.len(), y.len());
+        assert_eq!(values.len(), nx * ny * nc);
+        let mut d = vec![C::new(0.0, 0.0); nx * ny * 4 * nc];
+        for c in 0..nc {
+            let comp: Vec<C> = (0..nx * ny).map(|k| values[k * nc + c]).collect();
+            let s = Spline2::new(x.clone(), y.clone(), comp);
+            for k in 0..nx * ny {
+                d[(k * 4) * nc + c] = s.f[k];
+                d[(k * 4 + 1) * nc + c] = s.fx[k];
+                d[(k * 4 + 2) * nc + c] = s.fy[k];
+                d[(k * 4 + 3) * nc + c] = s.fxy[k];
+            }
+        }
+        Spline2N { x, y, nc, d }
+    }
+
+    /// All components at (u, v), clamped to the grid.
+    #[inline]
+    pub fn eval(&self, u: f64, v: f64, out: &mut [C]) {
+        let ny = self.y.len();
+        let u = u.clamp(self.x[0], *self.x.last().unwrap());
+        let v = v.clamp(self.y[0], *self.y.last().unwrap());
+        let i = Spline2::cell(&self.x, u);
+        let j = Spline2::cell(&self.y, v);
+        let hx = self.x[i + 1] - self.x[i];
+        let hy = self.y[j + 1] - self.y[j];
+        let hs = hermite((u - self.x[i]) / hx, hx);
+        let ht = hermite((v - self.y[j]) / hy, hy);
+        let nc = self.nc;
+        out[..nc].fill(C::new(0.0, 0.0));
+        for a in 0..2 {
+            for b in 0..2 {
+                let k = (i + a) * ny + (j + b);
+                let w = [hs[2 * a] * ht[2 * b], hs[2 * a + 1] * ht[2 * b], hs[2 * a] * ht[2 * b + 1], hs[2 * a + 1] * ht[2 * b + 1]];
+                let base = k * 4 * nc;
+                for (m, &wm) in w.iter().enumerate() {
+                    let row = &self.d[base + m * nc..base + (m + 1) * nc];
+                    for c in 0..nc {
+                        out[c] += row[c] * wm;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Tricubic Hermite interpolation of `nc` complex components on a rectangular
 /// (non-uniform) 3-D grid, with spline slopes and mixed derivatives.
 pub struct Spline3 {

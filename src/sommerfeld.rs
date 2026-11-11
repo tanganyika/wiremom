@@ -28,7 +28,7 @@
 
 use crate::mesh::Mesh;
 use crate::quad::{composite, gauss01};
-use crate::spline::{Spline2, Spline3};
+use crate::spline::{Spline2N, Spline3};
 use crate::vec3::*;
 use crate::{C0, EPS0, Error, MU0};
 use complex_bessel::{Scaling, besselj_seq, hankel1_seq, hankel2_seq};
@@ -303,7 +303,7 @@ pub struct Table {
     /// wavenumber in the ground / k, for the ground side's phase reference
     n_self: C,
     x: Vec<f64>,
-    splines: Vec<Spline2>,
+    spline: Spline2N,
 }
 
 impl Table {
@@ -375,8 +375,9 @@ impl Table {
             })
             .collect();
         let x: Vec<f64> = rs.iter().map(|r| k * r).collect();
-        let splines = (0..5).map(|c| Spline2::new(x.clone(), ts.clone(), vals.iter().map(|v| v[c]).collect())).collect();
-        Table { ground, freq, k, gamma0, side, fixed: fixed.is_some(), n_self, x, splines }
+        let flat: Vec<C> = vals.iter().flat_map(|v| v.iter().copied()).collect();
+        let spline = Spline2N::new(x.clone(), ts, 5, &flat);
+        Table { ground, freq, k, gamma0, side, fixed: fixed.is_some(), n_self, x, spline }
     }
 
     /// Phase reference divided out of the stored values.  In the air, the image
@@ -405,8 +406,9 @@ impl Table {
         let r = (rho * rho + h * h).sqrt();
         let th = h.atan2(rho);
         let back = (-J * Self::phase(self.side, self.n_self, k, rho, h)).exp() * (omega * k / r);
-        let x = k * r;
-        [0, 1, 2, 3, 4].map(|c| self.splines[c].eval(x, th) * back)
+        let mut out = [C::new(0.0, 0.0); 5];
+        self.spline.eval(k * r, th, &mut out);
+        out.map(|v| v * back)
     }
 }
 
