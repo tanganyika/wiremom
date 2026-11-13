@@ -11,7 +11,7 @@ port of Amos' complex Bessel functions). Matrix fill, LU, Sommerfeld tables and
 frequency sweeps run on all cores.
 
 It is the engine behind the *wiremom* option in
-[Wire Antenna Analyser](../wire-antenna-analyser).
+[wireant](../wireant).
 
 ## Features
 
