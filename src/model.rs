@@ -856,7 +856,7 @@ impl Model {
         let t1 = Instant::now();
         let nb = m.n_unknowns();
         let lu = lu::Lu::factor(z, nb).map_err(Error::new)?;
-        let (currents, src_current) = if self.networks.is_empty() {
+        let (currents, src_current, network_loss) = if self.networks.is_empty() {
             // every port is a source: superpose directly
             let mut v = vec![C::new(0.0, 0.0); nb];
             let mut gaps = vec![];
@@ -869,13 +869,13 @@ impl Model {
             }
             lu.solve(&mut v);
             let ic = gaps.iter().map(|g| g.iter().map(|&(b, s)| v[b] * s).sum()).collect();
-            (v, ic)
+            (v, ic, 0.0)
         } else {
             self.solve_ports(&m, &lu, freq)?
         };
         let t_fill_ms = (t1 - t0).as_secs_f64() * 1e3;
         let t_solve_ms = t1.elapsed().as_secs_f64() * 1e3;
-        Ok(Solution {
+        let mut sol = Solution {
             warnings: m.warnings.clone(),
             mesh: m,
             freq,
@@ -885,9 +885,41 @@ impl Model {
             ground: self.ground,
             second_ground: if self.ground == Ground::Free { None } else { self.second_ground },
             elements: OnceLock::new(),
+            losses: Losses::default(),
             t_fill_ms,
             t_solve_ms,
-        })
+        };
+        sol.losses = self.losses(&sol, network_loss)?;
+        Ok(sol)
+    }
+
+    /// Power lost in the wires' resistance, in the loads and in the networks.
+    fn losses(&self, sol: &Solution, networks: f64) -> Result<Losses, Error> {
+        let m = &sol.mesh;
+        let omega = 2.0 * PI * sol.freq;
+        // ½ Re(Z') ∫|I|² along each segment, with I = a_rise·Λ_rise + a_fall·Λ_fall
+        // (the same Gram integrals as the matrix: L/3 same shape, L/6 opposite)
+        let wire = sol
+            .segment_amplitudes()
+            .iter()
+            .enumerate()
+            .map(|(s, a)| {
+                let r = match self.wires[m.wire_of_seg[s]].conductor {
+                    Conductor::Lossy { sigma, mu_r } => (omega * MU0 * mu_r / (2.0 * sigma)).sqrt() / (2.0 * PI * m.radius[s]),
+                    _ => 0.0,
+                };
+                let i2 = m.len[s] / 3.0 * (a[RISE].norm_sqr() + a[FALL].norm_sqr()) + m.len[s] / 3.0 * (a[RISE] * a[FALL].conj()).re;
+                0.5 * r * i2
+            })
+            .sum();
+        let mut loads = 0.0;
+        for ld in &self.loads {
+            if let Some(zl) = ld.kind.impedance(omega) {
+                let i: C = m.gap(ld.wire, ld.node)?.iter().map(|&(b, s)| sol.currents[b] * s).sum();
+                loads += 0.5 * i.norm_sqr() * zl.re;
+            }
+        }
+        Ok(Losses { wire, loads, networks })
     }
 
     /// Port analysis for networks: the wire structure's admittance seen from every
@@ -895,7 +927,7 @@ impl Model {
     /// equations (Y_wire + Y_net) V = I_source.  Source ports have known V; the
     /// others carry no external current.  Returns basis currents and the current each
     /// source delivers (into the wire and the networks at its port).
-    fn solve_ports(&self, m: &Mesh, lu: &lu::Lu, freq: f64) -> Result<(Vec<C>, Vec<C>), Error> {
+    fn solve_ports(&self, m: &Mesh, lu: &lu::Lu, freq: f64) -> Result<(Vec<C>, Vec<C>, f64), Error> {
         let omega = 2.0 * PI * freq;
         let nb = m.n_unknowns();
         let mut ports: Vec<Port> = vec![];
@@ -932,9 +964,11 @@ impl Model {
             let segs = &m.wire_segs[p.wire];
             if p.node == 0 { m.p0[segs[0]] } else { m.p1[segs[p.node - 1]] }
         };
+        let mut net_y = vec![];
         for (n, &(a, b)) in self.networks.iter().zip(&net_ports) {
             let dist = norm(sub(node_pos(&n.a), node_pos(&n.b)));
             let (y11, y12, y22) = n.kind.admittance(omega, dist)?;
+            net_y.push((a, b, y11, y12, y22));
             y[a * np + a] += y11;
             y[a * np + b] += y12;
             y[b * np + a] += y12;
@@ -975,7 +1009,15 @@ impl Model {
             }
         }
         let src_current = src_port.iter().map(|&p| (0..np).map(|g| y[p * np + g] * v[g]).sum()).collect();
-        Ok((currents, src_current))
+        // power into the networks: ½ Re(V·I*) at both ports, I = Y_net V
+        let net_loss = net_y
+            .iter()
+            .map(|&(a, b, y11, y12, y22)| {
+                let (ia, ib) = (y11 * v[a] + y12 * v[b], y12 * v[a] + y22 * v[b]);
+                0.5 * (v[a] * ia.conj() + v[b] * ib.conj()).re
+            })
+            .sum();
+        Ok((currents, src_current, net_loss))
     }
 
     /// Solve at many frequencies in parallel (sharing Sommerfeld tables).
@@ -984,6 +1026,18 @@ impl Model {
         let _ = self.tables.prepare(self, freqs);
         freqs.par_iter().map(|&f| self.solve(f)).collect()
     }
+}
+
+/// Power lost in the structure (W), from the solved currents.  What the input power
+/// leaves after these and the radiated power is lost in the ground.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Losses {
+    /// skin-effect resistance of the wires
+    pub wire: f64,
+    /// resistance of the lumped loads
+    pub loads: f64,
+    /// power absorbed by the networks (line loss)
+    pub networks: f64,
 }
 
 /// Far-field gain components (linear, relative to input power).
@@ -1010,6 +1064,8 @@ pub struct Solution {
     /// far-field current elements (6 Gauss points per segment) and their media,
     /// built on first use
     elements: OnceLock<(Vec<(V3, [C; 3])>, Vec<u8>)>,
+    /// power lost in the wires, loads and networks
+    pub losses: Losses,
     /// notes about the geometry (see `Mesh::warnings`)
     pub warnings: Vec<String>,
     /// matrix fill (incl. meshing and Sommerfeld tables) and LU solve times
