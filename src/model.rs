@@ -554,6 +554,24 @@ impl Model {
             }
         }
 
+        // insulation: a local charge term on each sleeved segment (see mesh::Insulation),
+        // with the permittivity of the medium the segment is in
+        for s in 0..n {
+            let Some(ins) = self.wires[m.wire_of_seg[s]].insulation else { continue };
+            if !(ins.thickness > 0.0 && ins.eps_r > 0.0) {
+                continue;
+            }
+            let eps_out = if m.medium[s] == GROUND { eps } else { C::new(1.0, 0.0) };
+            let c = ((m.radius[s] + ins.thickness) / m.radius[s]).ln() / (2.0 * PI) * (1.0 / ins.eps_r - 1.0 / eps_out);
+            let w = inv_jweps * c / m.len[s];
+            for &(ma, ia) in &on_seg[s] {
+                for &(nb_, ib) in &on_seg[s] {
+                    let (ha, hb) = (m.basis[ma].halves[ia], m.basis[nb_].halves[ib]);
+                    z[ma * nb + nb_] += w * (ha.div * hb.div);
+                }
+            }
+        }
+
         // lumped loads across gaps; open circuits as a penalty forcing the gap current to 0
         let zmax = z.iter().map(|v| v.norm()).fold(0.0, f64::max);
         for ld in &self.loads {

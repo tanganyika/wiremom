@@ -27,6 +27,22 @@ pub enum Segments {
     Lengths(Vec<f64>),
 }
 
+/// A dielectric sleeve on a wire: its thickness (m) and relative permittivity.
+///
+/// Thin-coating model: across the sleeve the field is that of a coaxial line, so the
+/// sleeve changes the potential between the conductor and the medium outside by
+/// `q ln(b/a) / 2π · (1/εᵢ − 1/ε̃ₘ)` per unit charge (a = wire radius, b = a +
+/// thickness, ε̃ₘ = the medium around the sleeve: air, or the ground's complex
+/// permittivity for a wire in the soil). The field outside is that of the bare wire.
+/// In air this is the familiar extra series inductance μ0/2π (1 − 1/εᵢ) ln(b/a) for
+/// a current varying like the free-space wave; in the soil it also takes the wire
+/// out of conductive contact with the ground.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Insulation {
+    pub thickness: f64,
+    pub eps_r: f64,
+}
+
 /// Wire conductor for ohmic (skin-effect) loss.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Conductor {
@@ -42,13 +58,15 @@ pub struct Wire {
     pub radius: f64,
     pub segments: Segments,
     pub conductor: Conductor,
-    /// Extra series inductance per metre (H/m), e.g. from insulation.
+    /// Extra series inductance per metre (H/m).
     pub series_l_per_m: f64,
+    /// A dielectric sleeve (see [`Insulation`]).
+    pub insulation: Option<Insulation>,
 }
 
 impl Wire {
     pub fn new(start: V3, end: V3, radius: f64, nseg: usize) -> Wire {
-        Wire { start, end, radius, segments: Segments::Uniform(nseg), conductor: Conductor::Perfect, series_l_per_m: 0.0 }
+        Wire { start, end, radius, segments: Segments::Uniform(nseg), conductor: Conductor::Perfect, series_l_per_m: 0.0, insulation: None }
     }
     pub fn with_conductor(mut self, c: Conductor) -> Wire {
         self.conductor = c;

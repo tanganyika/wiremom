@@ -35,7 +35,7 @@ pub mod spline;
 pub mod surface;
 pub mod vec3;
 
-pub use mesh::{Conductor, Mesh, Segments, Wire};
+pub use mesh::{Conductor, Insulation, Mesh, Segments, Wire};
 pub use model::{Gain, Ground, Load, LoadKind, Losses, Model, Port, Solution, Source, TableCache, TwoPort, TwoPortKind};
 pub use farground::{Boundary, SecondGround};
 pub use sommerfeld::RealGround;
