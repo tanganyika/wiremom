@@ -126,6 +126,22 @@ pub struct Mesh {
     /// Wire-to-surface junctions: (wire basis with the wire's half, surface vertex).
     /// The basis continues onto the surface around the vertex.
     pub junctions: Vec<(usize, usize)>,
+    /// Flat end caps on free wire ends (see [`Mesh::add_end_caps`]).
+    pub caps: Vec<Cap>,
+}
+
+/// A flat end cap: the free end of segment `seg` closed by a disk of the wire's
+/// radius.  Its basis function `basis` carries current up the last segment onto the
+/// disk, whose charge balances the segment's.
+#[derive(Clone, Copy, Debug)]
+pub struct Cap {
+    pub basis: usize,
+    pub seg: usize,
+    /// Centre of the disk (the wire's end).
+    pub at: V3,
+    pub radius: f64,
+    /// Charge on the disk per unit basis charge, `-div` of the basis's half (±1).
+    pub q: f64,
 }
 
 pub const AIR: u8 = 0;
@@ -168,6 +184,7 @@ pub fn build_with(wires: &[Wire], surfaces: &[crate::surface::Surface], surface:
         warnings: vec![],
         surf: SurfMesh::default(),
         junctions: vec![],
+        caps: vec![],
     };
     for (wi, w) in wires.iter().enumerate() {
         let total = w.length();
@@ -354,6 +371,38 @@ fn half(seg: usize, end: usize, inward: bool) -> Half {
 }
 
 impl Mesh {
+    /// Close every free wire end with a flat cap (a solid rod's end): adds a basis
+    /// function there whose current runs onto the disk.  Ends touching the ground
+    /// plane or the ground surface, on surfaces and at junctions are left alone, as
+    /// are insulated wires (`wires` are the ones the mesh was built from), whose
+    /// sleeve would cover the end.
+    pub fn add_end_caps(&mut self, wires: &[Wire]) {
+        let mut count = vec![0usize; self.nodes.len()];
+        for sn in &self.seg_nodes {
+            count[sn[0]] += 1;
+            count[sn[1]] += 1;
+        }
+        let mut has_basis = vec![false; self.nodes.len()];
+        for b in &self.basis {
+            has_basis[b.node] = true;
+        }
+        for s in 0..self.n_segments() {
+            for e in 0..2 {
+                let n = self.seg_nodes[s][e];
+                if count[n] != 1 || has_basis[n] || wires.get(self.wire_of_seg[s]).is_some_and(|w| w.insulation.is_some()) {
+                    continue;
+                }
+                // an end touching the ground plane / interface is not free
+                if (self.ground_plane || self.medium.contains(&GROUND)) && self.nodes[n][2].abs() <= self.radius[s] {
+                    continue;
+                }
+                let h = half(s, e, true);
+                self.caps.push(Cap { basis: self.basis.len(), seg: s, at: self.nodes[n], radius: self.radius[s], q: -h.div });
+                self.basis.push(Basis { node: n, halves: vec![h] });
+            }
+        }
+    }
+
     pub fn n_segments(&self) -> usize {
         self.len.len()
     }
@@ -393,7 +442,7 @@ impl Mesh {
         let n = self.seg_nodes[seg][end];
         let mut out = vec![];
         for (bi, b) in self.basis.iter().enumerate() {
-            if b.node != n {
+            if b.node != n || self.caps.iter().any(|c| c.basis == bi) {
                 continue;
             }
             for h in &b.halves {

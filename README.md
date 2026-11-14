@@ -18,6 +18,7 @@ It is the engine behind the *wiremom* option in
 | Feature | Status |
 |---|---|
 | Straight wires, any orientation, automatic junctions | ✅ |
+| Thick wires: tube (exact) kernel, segments down to half a radius, stepped radii, flat end caps | ✅ |
 | Equal or arbitrary segment lengths per wire (e.g. MMANA-style tapers) | ✅ |
 | Voltage sources with phase, at interior nodes, wire joints, junctions, ground connections | ✅ |
 | Lumped loads: series/parallel RLC, fixed impedances, open circuits | ✅ |
@@ -79,10 +80,24 @@ this wire and the junction.
    tolerance become shared nodes. A node shared by *k* ends carries *k − 1*
    triangle basis functions. On a perfect ground, an end at z = 0 gets a
    half-triangle completed by its image.
-2. **Matrix.** `Z_mn = jωμ ∬ Λm Λn (ŝm·ŝn) G + (1/jωε) ∬ Λm′ Λn′ G` with the
-   reduced thin-wire kernel. The 1/R singularity is integrated analytically along
-   the source segment and the rest by Gauss–Legendre quadrature. Wires of
-   different radius use the mean of a², which keeps Z symmetric.
+2. **Matrix.** `Z_mn = jωμ ∬ Λm Λn (ŝm·ŝn) G + (1/jωε) ∬ Λm′ Λn′ G`. By
+   default (`Kernel::Exact`) segment pairs closer than a few radii use the
+   **tube (exact) kernel**: the current spread round each wire's surface and G
+   averaged over both circumferences, `R² = d² + a₁² + a₂² − 2a₁a₂ cos φ`. Its
+   static part is a complete elliptic integral whose logarithmic singularity is
+   taken out and integrated analytically; the rest is Gauss–Legendre, split at
+   the singular point and on the radius scale. Farther pairs use the reduced
+   kernel `R² = d² + a₁² + a₂²`, which matches the tube kernel's 1/R expansion to
+   O(a⁴/d⁴). It stays accurate with segments down to half a radius, where the
+   thin-wire **reduced kernel** (`Kernel::Reduced`: current on the axis,
+   `R² = d² + a²` with the mean of a², the original behaviour) breaks down.
+   Wires of different radius meet correctly (checked against a stepped tube).
+   Free wire ends get **flat end caps** by default (`Model::end_caps`): a basis
+   function carries the current onto the end disk, whose charge balances the
+   last segment's, as on a solid rod. A thick element is then electrically
+   longer, and its resonance no longer drifts with the segment length (an open
+   end with zero current converges slowly). Insulated wires and ends on the
+   ground or on surfaces are left open.
 3. **Ground.** Images handle perfect ground. For real ground, the reflected
    field is a Sommerfeld integral over TE/TM Fresnel-reflected plane waves (see
    [src/sommerfeld.rs](src/sommerfeld.rs)). As in NEC-2, the near-singular
@@ -285,8 +300,15 @@ These are the weaker spots, with how far they have been checked.
     1,350-unknown radial system lying in the soil takes about 0.9 s per
     frequency (0.75 s fill, 0.17 s LU);
   - no frequency interpolation of the matrix yet.
-- **Thin-wire limits as usual:** segments much shorter than about two wire
-  diameters, or wires closer than a few radii, lose accuracy, as in NEC.
+- **Thick wires:** with the default tube kernel, segments can be as short as
+  half a radius (tested against published and independently computed
+  thick-dipole admittances, `tests/thick.rs`). Wires closer than a few radii to
+  each other are still treated as if their surface currents were uniform round
+  the circumference (no proximity effect). With a delta-gap source, the input
+  susceptance of a thick wire grows slowly as the segments at the feed shrink:
+  that is the gap's capacitance, real for an infinitesimal gap, not an error.
+  `Kernel::Reduced` keeps NEC-2's thin-wire limits (segments longer than about
+  two diameters).
 - **Line loss** is given as dB/100 m at the solve frequency; there's no
   frequency-dependent loss model or complex characteristic impedance.
 
@@ -295,6 +317,11 @@ These are the weaker spots, with how far they have been checked.
 - R. F. Harrington, *Field Computation by Moment Methods* (1968).
 - D. R. Wilton, C. M. Butler, IEEE Trans. AP-24, 1976 (thin-wire integral
   equations).
+- D. R. Wilton, N. J. Champagne, IEEE Trans. AP-54, 2006 (evaluating the exact
+  thin-wire kernel).
+- S. A. S. Saoudy, *Input admittance of linear antennas with wide feed gaps*,
+  PhD thesis, University of Manitoba, 1987, App. B (thick-dipole admittance
+  tables used in the tests).
 - S. M. Rao, D. R. Wilton, A. W. Glisson, IEEE Trans. AP-30, 1982 (RWG, for
   surfaces).
 - K. A. Michalski, J. R. Mosig, IEEE Trans. AP-45, 1997 (layered-media Green's

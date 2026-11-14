@@ -9,7 +9,7 @@
 //! and Z I = V with V the delta-gap voltages.
 
 use crate::farground::SecondGround;
-use crate::kernel::{self, PairIntegrals};
+use crate::kernel::{self, Kernel, PairIntegrals};
 use crate::lu;
 use crate::mesh::{self, AIR, Conductor, FALL, GROUND, Mesh, RISE, Surface, Wire};
 use crate::quad::gauss01;
@@ -309,6 +309,16 @@ pub struct Model {
     pub networks: Vec<TwoPort>,
     /// Conducting surfaces (plates); currently not connected to wires.
     pub surfaces: Vec<surface::Surface>,
+    /// Wire kernel: [`Kernel::Exact`] (tube, default) or [`Kernel::Reduced`]
+    /// (thin-wire, the original behaviour).
+    pub kernel: Kernel,
+    /// Close free wire ends in the air with flat caps (solid rods): the current
+    /// runs onto the end disk instead of stopping at the last node, which makes a
+    /// thick element electrically longer (by about a tenth of the radius per end
+    /// against a converged open tube, more at practical segment lengths, where the
+    /// open end is not converged).  Default on.  `end_caps = false` with
+    /// [`Kernel::Reduced`] is the original solver.  See [`Mesh::add_end_caps`].
+    pub end_caps: bool,
 }
 
 impl Model {
@@ -329,6 +339,8 @@ impl Model {
             tables: TableCache::default(),
             networks: vec![],
             surfaces: vec![],
+            kernel: Kernel::default(),
+            end_caps: true,
         }
     }
 
@@ -354,7 +366,11 @@ impl Model {
             Ground::Perfect => Surface::Perfect,
             Ground::Real(_) => Surface::Interface,
         };
-        mesh::build_with(&self.wires, &self.surfaces, surface, self.merge_tol)
+        let mut m = mesh::build_with(&self.wires, &self.surfaces, surface, self.merge_tol)?;
+        if self.end_caps {
+            m.add_end_caps(&self.wires);
+        }
+        Ok(m)
     }
 
     /// The air-side Sommerfeld table for this mesh (wires and surfaces).
@@ -433,7 +449,10 @@ impl Model {
         // pairs are integrated both ways (the quadrature isn't exactly symmetric
         // there); distant ones once, and transposed below.
         let n_max = self.n_outer.max(self.n_inner);
-        let near = |p: usize, q: usize| !self.adaptive || kernel::order(&seg(p), &seg(q), n_max) >= n_max;
+        let order = |a: &kernel::Seg, b: &kernel::Seg| {
+            if self.kernel == Kernel::Exact && kernel::needs_exact(a, b) { n_max } else { kernel::order(a, b, n_max) }
+        };
+        let near = |p: usize, q: usize| !self.adaptive || order(&seg(p), &seg(q)) >= n_max;
         let mut pairs: Vec<Vec<([[C; 2]; 2], C)>> = (0..n)
             .into_par_iter()
             .map(|p| {
@@ -452,24 +471,24 @@ impl Model {
                             _ => (k, c_cross, zero, inv_jweps),
                         };
                         let (no, ni) = if self.adaptive {
-                            let n = kernel::order(&sp, &sq, self.n_outer.max(self.n_inner));
+                            let n = order(&sp, &sq);
                             (n.min(self.n_outer), n.min(self.n_inner))
                         } else {
                             (self.n_outer, self.n_inner)
                         };
-                        let f: PairIntegrals = kernel::pair(&sp, &sq, kk, no, ni);
+                        let f: PairIntegrals = kernel::pair_with(self.kernel, &sp, &sq, kk, no, ni);
                         let mut v = f.t.map(|r| r.map(|x| jwmu * tt * x));
                         let mut s = s_scale * inv_e * f.s;
                         if img != zero {
                             // image: reflected segment with negated current and charge
                             let si = kernel::Seg { p0: reflect(m.p0[q]), t: reflect(m.t[q]), ..sq };
                             let (no, ni) = if self.adaptive {
-                                let n = kernel::order(&sp, &si, self.n_outer.max(self.n_inner));
+                                let n = order(&sp, &si);
                                 (n.min(self.n_outer), n.min(self.n_inner))
                             } else {
                                 (self.n_outer, self.n_inner)
                             };
-                            let fi = kernel::pair(&sp, &si, kk, no, ni);
+                            let fi = kernel::pair_with(self.kernel, &sp, &si, kk, no, ni);
                             let tti = dot(m.t[p], reflect(m.t[q]));
                             for a in 0..2 {
                                 for b in 0..2 {
@@ -527,6 +546,56 @@ impl Model {
             }
         });
         drop(pairs);
+
+        // end caps: the disk charge of each cap basis against every segment charge
+        // and every other cap, in the media as for segment pairs (closed-form
+        // images; the Sommerfeld remainder is left out for the small cap charges)
+        if !m.caps.is_empty() {
+            let segs: Vec<kernel::Seg> = (0..n).map(seg).collect();
+            // (k, scale, image, 1/(j w eps)) between two media, as in the pair fill
+            let media = |mp: u8, mq: u8| match (mp, mq) {
+                (AIR, AIR) => (k, C::new(1.0, 0.0), img_air, inv_jweps),
+                (GROUND, GROUND) => (k_ground, C::new(1.0, 0.0), -g0, inv_jweps_g),
+                _ => (k, c_cross, zero, inv_jweps),
+            };
+            let cap_seg: Vec<Vec<C>> = m
+                .caps
+                .par_iter()
+                .map(|c| {
+                    let mc = m.medium[c.seg];
+                    (0..n)
+                        .map(|q| {
+                            let (kk, sc, img, inv_e) = media(mc, m.medium[q]);
+                            let mut v = kernel::cap_line(c.at, c.radius, &segs[q], kk, self.n_inner);
+                            if img != zero {
+                                let si = kernel::Seg { p0: reflect(m.p0[q]), t: reflect(m.t[q]), ..segs[q] };
+                                v -= img * kernel::cap_line(c.at, c.radius, &si, kk, self.n_inner);
+                            }
+                            v * sc * inv_e
+                        })
+                        .collect()
+                })
+                .collect();
+            for (ci, c) in m.caps.iter().enumerate() {
+                for (bi, b) in m.basis.iter().enumerate() {
+                    let mut acc = zero;
+                    for h in &b.halves {
+                        acc += cap_seg[ci][h.seg] * (h.div / m.len[h.seg]);
+                    }
+                    let t = c.q * acc;
+                    z[c.basis * nb + bi] += t;
+                    z[bi * nb + c.basis] += t;
+                }
+                for (dj, d) in m.caps.iter().enumerate() {
+                    let (kk, sc, img, inv_e) = media(m.medium[c.seg], m.medium[d.seg]);
+                    let mut v = kernel::cap_cap(c.at, c.radius, d.at, d.radius, ci == dj, kk);
+                    if img != zero {
+                        v -= img * kernel::cap_cap(c.at, c.radius, reflect(d.at), d.radius, false, kk);
+                    }
+                    z[c.basis * nb + d.basis] += sc * inv_e * c.q * d.q * v;
+                }
+            }
+        }
 
         // distributed series impedance: skin-effect R' and extra L', times the Gram
         // integral of two linear shapes on one segment (L/3 same shape, L/6 opposite)

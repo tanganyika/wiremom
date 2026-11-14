@@ -4,7 +4,7 @@
 use num_complex::Complex64 as C;
 use serde_json::Value;
 use wiremom::sommerfeld::{Coeffs, reflected_dyadic};
-use wiremom::{Conductor, Ground, LoadKind, Model, RealGround, Wire};
+use wiremom::{Conductor, Ground, Kernel, LoadKind, Model, RealGround, Wire};
 
 fn data() -> Value {
     let s = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/reference.json")).unwrap();
@@ -19,7 +19,7 @@ fn v3(v: &Value) -> [f64; 3] {
     [v[0].as_f64().unwrap(), v[1].as_f64().unwrap(), v[2].as_f64().unwrap()]
 }
 
-fn model(case: &Value) -> Model {
+fn model(case: &Value, kernel: Kernel) -> Model {
     let g = &case["ground"];
     let ground = match g["kind"].as_str().unwrap() {
         "free" => Ground::Free,
@@ -39,6 +39,8 @@ fn model(case: &Value) -> Model {
         })
         .collect();
     let mut m = Model::new(wires, ground);
+    m.kernel = kernel;
+    m.end_caps = kernel == Kernel::Exact;
     // exact tables, as the Python prototype used
     m.ground_table_reuse = 0.0;
     let src = &case["source"];
@@ -56,8 +58,8 @@ fn model(case: &Value) -> Model {
     m
 }
 
-fn solve_case(case: &Value) -> (C, Vec<f64>) {
-    let m = model(case);
+fn solve_case(case: &Value, kernel: Kernel) -> (C, Vec<f64>) {
+    let m = model(case, kernel);
     let sol = m.solve(case["freq"].as_f64().unwrap()).unwrap();
     let gains = case["directions_deg"]
         .as_array()
@@ -73,7 +75,8 @@ fn matches_python_prototype() {
     let d = data();
     for case in d["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
-        let (z, g) = solve_case(case);
+        // the prototype is the reduced (thin-wire) kernel
+        let (z, g) = solve_case(case, Kernel::Reduced);
         let zp = cplx(&case["python"]["z"]);
         let real = case["ground"]["kind"] == "real";
         // free space / PEC are the same algorithm to rounding; over real ground the
@@ -94,7 +97,7 @@ fn agrees_with_nec2c() {
     for case in d["cases"].as_array().unwrap() {
         let Some(nec) = case.get("nec2c") else { continue };
         let name = case["name"].as_str().unwrap();
-        let (z, g) = solve_case(case);
+        let (z, g) = solve_case(case, Kernel::default());
         let zn = cplx(&nec["z"]);
         // resistance and gain are tightly comparable; reactance differs by the feed
         // model (node gap vs. segment gap), most in the near-cancelling loaded case
