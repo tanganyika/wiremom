@@ -26,6 +26,7 @@ It is the engine behind the *wiremom* option in
 | Skin-effect loss (conductivity, relative permeability) and extra series L per metre (insulation) | ✅ |
 | Free space, perfect ground (wires may touch it), Sommerfeld real ground | ✅ |
 | Wires buried in or crossing lossy ground (radials, ground rods, buried counterpoises) | ✅ |
+| Sloping ground: a perfect or real ground plane tilted through the origin, solved exactly (wires stay in world coordinates, patterns reach below the horizon downhill) | ✅ |
 | A second ground medium for the far field (sea beyond a shore, a marsh, a cliff drop), straight or circular boundary, as NEC-2's GD card, with a Fresnel-zone transition | ✅ |
 | Conducting surfaces (triangular RWG patches, e.g. plates, reflectors, car bodies), coupled to wires, over any ground | ✅ |
 | Wire-to-surface junctions (a wire ending on a surface vertex feeds current into it) | ✅ |
@@ -157,6 +158,23 @@ this wire and the junction.
    it. Low rays from low antennas have zones hundreds of metres long, so a shore
    well beyond the specular point still matters. `fresnel = false` gives NEC-2's
    behaviour.
+8. **Sloping ground** (`Model::slope`, [src/slope.rs](src/slope.rs)). A
+   tilted half-space is a flat one in turned coordinates, so the structure is
+   rotated into the ground frame (the surface at z = 0), solved there exactly
+   as above (images, Sommerfeld tables, buried wires), and the results are
+   turned back: `far_field`, `gain`, `segment_currents` and `current_elements`
+   take and give world coordinates, while `Solution::mesh` stays in the ground
+   frame (`Solution::frame` holds the rotation). Downhill the pattern reaches
+   below the horizon; it is zero below the sloping surface.
+
+   ```rust
+   use wiremom::Slope;
+   // 10° slope falling toward +x; wires stay as built, masts vertical
+   m.slope = Some(Slope::new(10f64.to_radians(), 0.0));
+   ```
+
+   `cargo run --release --example hillside` shows a 20 m dipole's pattern as
+   the slope grows: the whole pattern tilts with the ground.
 
 ## Validation
 
@@ -219,7 +237,12 @@ this wire and the junction.
     with and without a 5 m drop, horizontal and vertical dipoles) within
     0.1 dB away from the transition angles; a distant boundary changes nothing;
     radius 0 gives medium 2 everywhere; the Fresnel transition is continuous and
-    matches NEC-2 far from the shore.
+    matches NEC-2 far from the shore;
+  - sloping ground: a tilted perfect ground matches the dipole and its explicit
+    mirror image in free space (impedance to 1e-6, gain and both polarisations
+    in every direction above the slope, nothing below it, efficiency 1); a
+    tilted real ground matches the antenna turned by hand over level ground
+    (to 1e-9); slope 0 is level ground.
 
 No Python is needed to build, run or test the crate. The prototype in `python/`
 is a frozen reference: `python/tools/make_reference.py` regenerates the JSON if
@@ -289,6 +312,10 @@ These are the weaker spots, with how far they have been checked.
   the impedance) see only the ground under the antenna. The cliff face itself
   doesn't reflect or diffract. Circles smaller than the Fresnel zone are
   approximate (treated as their tangent line).
+- **Sloping ground** runs on for ever: exact for the currents and for rays
+  reflecting near the antenna, but optimistic for low rays toward a valley,
+  which in reality reflect from terrain far away. It can't yet be combined with
+  a second ground medium.
 - **Not supported:** surfaces in or touching lossy ground, curved surfaces
   (other than as flat triangles), and NEC deck import/export (the application
   using this crate does that).

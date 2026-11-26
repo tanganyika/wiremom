@@ -3,7 +3,7 @@
 //! An open-source thin-wire method-of-moments antenna solver using the
 //! mixed-potential integral equation (MPIE) with triangle basis functions and
 //! Galerkin testing, with free space, a perfect ground plane, or real (lossy)
-//! ground by the Sommerfeld half-space solution.
+//! ground by the Sommerfeld half-space solution, level or sloping.
 //!
 //! ```
 //! use wiremom::{Ground, Model, Wire, C0};
