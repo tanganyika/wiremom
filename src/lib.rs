@@ -30,6 +30,7 @@ pub mod lu;
 pub mod mesh;
 pub mod model;
 pub mod quad;
+pub mod slope;
 pub mod sommerfeld;
 pub mod spline;
 pub mod surface;
@@ -39,6 +40,7 @@ pub use kernel::Kernel;
 pub use mesh::{Conductor, Insulation, Mesh, Segments, Wire};
 pub use model::{Gain, Ground, Load, LoadKind, Losses, Model, Port, Solution, Source, TableCache, TwoPort, TwoPortKind};
 pub use farground::{Boundary, SecondGround};
+pub use slope::Slope;
 pub use sommerfeld::RealGround;
 pub use surface::Surface;
 

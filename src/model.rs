@@ -9,6 +9,7 @@
 //! and Z I = V with V the delta-gap voltages.
 
 use crate::farground::SecondGround;
+use crate::slope::{Frame, Slope};
 use crate::kernel::{self, Kernel, PairIntegrals};
 use crate::lu;
 use crate::mesh::{self, AIR, Conductor, FALL, GROUND, Mesh, RISE, Surface, Wire};
@@ -319,6 +320,10 @@ pub struct Model {
     /// open end is not converged).  Default on.  `end_caps = false` with
     /// [`Kernel::Reduced`] is the original solver.  See [`Mesh::add_end_caps`].
     pub end_caps: bool,
+    /// Tilt the ground (perfect or real) into a sloping plane through the origin
+    /// (see [`Slope`]).  Wires stay in world coordinates and must be above it.
+    /// Not yet combined with a second ground medium.
+    pub slope: Option<Slope>,
 }
 
 impl Model {
@@ -341,7 +346,33 @@ impl Model {
             surfaces: vec![],
             kernel: Kernel::default(),
             end_caps: true,
+            slope: None,
         }
+    }
+
+    /// With a sloping ground: this model turned into the ground frame (ground at
+    /// z = 0, no slope), and the frame.
+    fn in_ground_frame(&self) -> Result<Option<(Model, Frame)>, Error> {
+        let Some(sl) = self.slope else { return Ok(None) };
+        if self.ground == Ground::Free {
+            return Ok(None);
+        }
+        if self.second_ground.is_some() {
+            return Err(Error::new("a sloping ground cannot yet be combined with a second ground medium"));
+        }
+        let f = sl.frame();
+        let mut m = self.clone();
+        m.slope = None;
+        for w in &mut m.wires {
+            w.start = f.to_ground(w.start);
+            w.end = f.to_ground(w.end);
+        }
+        for s in &mut m.surfaces {
+            for v in &mut s.vertices {
+                *v = f.to_ground(*v);
+            }
+        }
+        Ok(Some((m, f)))
     }
 
     pub fn add_source(&mut self, wire: usize, node: usize, voltage: C) {
@@ -937,6 +968,11 @@ impl Model {
         if self.sources.is_empty() {
             return Err(Error::new("the model has no source"));
         }
+        if let Some((m, f)) = self.in_ground_frame()? {
+            let mut sol = m.solve(freq)?;
+            sol.frame = Some(f);
+            return Ok(sol);
+        }
         let t0 = Instant::now();
         let m = Arc::new(self.mesh()?);
         let z = self.impedance_matrix(&m, freq)?;
@@ -972,6 +1008,7 @@ impl Model {
             ground: self.ground,
             second_ground: if self.ground == Ground::Free { None } else { self.second_ground },
             elements: OnceLock::new(),
+            frame: None,
             losses: Losses::default(),
             t_fill_ms,
             t_solve_ms,
@@ -1110,7 +1147,10 @@ impl Model {
     /// Solve at many frequencies in parallel (sharing Sommerfeld tables).
     pub fn sweep(&self, freqs: &[f64]) -> Vec<Result<Solution, Error>> {
         // a failure here (e.g. wires under ground) is reported by every solve below
-        let _ = self.tables.prepare(self, freqs);
+        match self.in_ground_frame() {
+            Ok(Some((m, _))) => drop(self.tables.prepare(&m, freqs)),
+            _ => drop(self.tables.prepare(self, freqs)),
+        }
         freqs.par_iter().map(|&f| self.solve(f)).collect()
     }
 }
@@ -1151,6 +1191,10 @@ pub struct Solution {
     /// far-field current elements (6 Gauss points per segment) and their media,
     /// built on first use
     elements: OnceLock<(Vec<(V3, [C; 3])>, Vec<u8>)>,
+    /// Over a sloping ground, the rotation into the ground frame the structure was
+    /// solved in.  `mesh` is in the ground frame; currents, elements and far-field
+    /// directions are given in world coordinates.
+    pub frame: Option<Frame>,
     /// power lost in the wires, loads and networks
     pub losses: Losses,
     /// notes about the geometry (see `Mesh::warnings`)
@@ -1198,7 +1242,8 @@ impl Solution {
     /// Current at the middle of every segment: (start, end, current along the wire).
     pub fn segment_currents(&self) -> Vec<(V3, V3, C)> {
         let m = &self.mesh;
-        self.segment_amplitudes().iter().enumerate().map(|(s, a)| (m.p0[s], m.p1[s], 0.5 * (a[RISE] + a[FALL]))).collect()
+        let w = |p: V3| self.frame.map_or(p, |f| f.to_world(p));
+        self.segment_amplitudes().iter().enumerate().map(|(s, a)| (w(m.p0[s]), w(m.p1[s]), 0.5 * (a[RISE] + a[FALL]))).collect()
     }
 
     /// Current elements for far-field sums: `n_q` Gauss points per segment, each
@@ -1216,8 +1261,20 @@ impl Solution {
             }
         }
         // surfaces: the 7-point rule on every triangle
-        out.extend(self.surface_elements());
-        out
+        out.extend(self.surface_elements_local(&surface::TRI7[..]));
+        self.elements_to_world(out)
+    }
+
+    fn elements_to_world(&self, mut els: Vec<(V3, [C; 3])>) -> Vec<(V3, [C; 3])> {
+        if let Some(f) = self.frame {
+            for (p, c) in &mut els {
+                *p = f.to_world(*p);
+                let re = f.to_world(c.map(|x| x.re));
+                let im = f.to_world(c.map(|x| x.im));
+                *c = [0, 1, 2].map(|i| C::new(re[i], im[i]));
+            }
+        }
+        els
     }
 
     /// Current elements for the far field, with their media: Gauss points along
@@ -1243,19 +1300,19 @@ impl Solution {
         // small triangles: the 3-point rule (exact for their linear currents' moments
         // up to the phase variation across them)
         let small = sm.area.iter().all(|a| k * a.sqrt() < 0.8);
-        out.extend(self.surface_elements_with(if small { &surface::TRI3[..] } else { &surface::TRI7[..] }));
+        out.extend(self.surface_elements_local(if small { &surface::TRI3[..] } else { &surface::TRI7[..] }));
         med.resize(out.len(), AIR);
         (out, med)
     }
 
     /// Surface current elements: (point, J·dA) at the 7-point rule of each triangle.
     pub fn surface_elements(&self) -> Vec<(V3, [C; 3])> {
-        self.surface_elements_with(&surface::TRI7[..])
+        self.elements_to_world(self.surface_elements_local(&surface::TRI7[..]))
     }
 
     /// Surface current elements on the given triangle rule (barycentric points,
     /// weights summing to 1), plus the junctions' surface parts.
-    fn surface_elements_with(&self, rule: &[([f64; 3], f64)]) -> Vec<(V3, [C; 3])> {
+    fn surface_elements_local(&self, rule: &[([f64; 3], f64)]) -> Vec<(V3, [C; 3])> {
         let m = &self.mesh;
         let sm = &m.surf;
         let nw = m.basis.len();
@@ -1292,7 +1349,24 @@ impl Solution {
     }
 
     /// Far-field factors (E_theta, E_phi)·r·exp(jkr) toward (theta from zenith, phi).
+    /// Over a sloping ground, directions are world ones (theta may then exceed 90°
+    /// downhill) and the field is zero below the ground surface.
     pub fn far_field(&self, theta: f64, phi: f64) -> (C, C) {
+        let Some(f) = self.frame else { return self.far_field_local(theta, phi) };
+        let (st, ct, sp, cp) = (theta.sin(), theta.cos(), phi.sin(), phi.cos());
+        let r = f.to_ground([st * cp, st * sp, ct]);
+        let th_l = r[2].clamp(-1.0, 1.0).acos();
+        let ph_l = r[1].atan2(r[0]);
+        let (et, ep) = self.far_field_local(th_l, ph_l);
+        // E = et θ̂' + ep φ̂' in the ground frame, projected on the world θ̂, φ̂
+        let (sl, cl, spl, cpl) = (th_l.sin(), th_l.cos(), ph_l.sin(), ph_l.cos());
+        let th_w = f.to_world([cl * cpl, cl * spl, -sl]);
+        let ph_w = f.to_world([-spl, cpl, 0.0]);
+        let (th, ph) = ([ct * cp, ct * sp, -st], [-sp, cp, 0.0]);
+        (et * dot(th_w, th) + ep * dot(ph_w, th), et * dot(th_w, ph) + ep * dot(ph_w, ph))
+    }
+
+    fn far_field_local(&self, theta: f64, phi: f64) -> (C, C) {
         let k = 2.0 * PI * self.freq / C0;
         let (st, ct, sp, cp) = (theta.sin(), theta.cos(), phi.sin(), phi.cos());
         let rhat = [st * cp, st * sp, ct];
@@ -1395,14 +1469,15 @@ impl Solution {
         let th_max = if self.ground == Ground::Free { PI } else { PI / 2.0 };
         let (x, w) = gauss01(n_theta);
         let n_theta = x.len();
-        let p_in = self.input_power();
         let s: f64 = (0..n_theta * n_phi)
             .into_par_iter()
             .map(|i| {
                 let (it, ip) = (i / n_phi, i % n_phi);
                 let th = x[it] * th_max;
                 let ph = ip as f64 * 2.0 * PI / n_phi as f64;
-                self.gain(th, ph).total * p_in / (4.0 * PI) * th.sin() * w[it]
+                // in the ground frame (the upper half there), which needs no rotation
+                let (et, ep) = self.far_field_local(th, ph);
+                (et.norm_sqr() + ep.norm_sqr()) / (2.0 * ETA0) * th.sin() * w[it]
             })
             .sum();
         s * th_max * 2.0 * PI / n_phi as f64
