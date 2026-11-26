@@ -34,6 +34,7 @@ pub mod slope;
 pub mod sommerfeld;
 pub mod spline;
 pub mod surface;
+pub mod terrain;
 pub mod vec3;
 
 pub use kernel::Kernel;
@@ -43,6 +44,7 @@ pub use farground::{Boundary, SecondGround};
 pub use slope::Slope;
 pub use sommerfeld::RealGround;
 pub use surface::Surface;
+pub use terrain::{Profile, Terrain};
 
 pub const C0: f64 = 299_792_458.0;
 pub const MU0: f64 = 4.0e-7 * std::f64::consts::PI;

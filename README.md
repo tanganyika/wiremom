@@ -27,6 +27,7 @@ It is the engine behind the *wiremom* option in
 | Free space, perfect ground (wires may touch it), Sommerfeld real ground | ✅ |
 | Wires buried in or crossing lossy ground (radials, ground rods, buried counterpoises) | ✅ |
 | Sloping ground: a perfect or real ground plane tilted through the origin, solved exactly (wires stay in world coordinates, patterns reach below the horizon downhill) | ✅ |
+| Terrain for the far field: height profiles along any bearings (hills, ridges, valleys, cliffs), with reflections from each facet and knife-edge diffraction over ridges | ✅ |
 | A second ground medium for the far field (sea beyond a shore, a marsh, a cliff drop), straight or circular boundary, as NEC-2's GD card, with a Fresnel-zone transition | ✅ |
 | Conducting surfaces (triangular RWG patches, e.g. plates, reflectors, car bodies), coupled to wires, over any ground | ✅ |
 | Wire-to-surface junctions (a wire ending on a surface vertex feeds current into it) | ✅ |
@@ -175,6 +176,31 @@ this wire and the junction.
 
    `cargo run --release --example hillside` shows a 20 m dipole's pattern as
    the slope grows: the whole pattern tilts with the ground.
+9. **Terrain** (`Model::terrain`, [src/terrain.rs](src/terrain.rs)). As in
+   HFTA, the ground's height along each bearing (a profile of straight facets)
+   shapes the far field; the currents still see the ground under the antenna.
+   Toward each bearing the terrain is taken as two-dimensional. Every facet
+   reflects with its own image and Fresnel coefficients at the ray's grazing
+   angle to it, weighted by the physical-optics integral over its lit part
+   (as the second ground's transition). Ridges in front cut the direct ray and,
+   seen from the image, the reflected rays as knife edges: the exact Fresnel
+   factor where a ridge blocks the ray, and ITU-R P.526's smooth loss where it
+   only comes close (the exact factor's ripple there would count the ridge's
+   diffraction twice). A level profile is exactly level ground.
+
+   ```rust
+   use wiremom::{Profile, Terrain};
+   // toward +x: level for 50 m, then down 100 m over the next 950 m (a hilltop);
+   // toward -x: a 30 m ridge 300 m away; blended in between
+   m.terrain = Some(Terrain { profiles: vec![
+       Profile::new(0.0, vec![[0.0, 0.0], [50.0, 0.0], [1000.0, -100.0]]),
+       Profile::new(std::f64::consts::PI, vec![[0.0, 0.0], [300.0, 30.0], [800.0, 30.0]]),
+   ] });
+   ```
+
+   `cargo run --release --example terrain` compares it with level ground, the
+   slope model and the second ground's cliff, and shows a hill, a hilltop and
+   a valley.
 
 ## Validation
 
@@ -242,7 +268,14 @@ this wire and the junction.
     mirror image in free space (impedance to 1e-6, gain and both polarisations
     in every direction above the slope, nothing below it, efficiency 1); a
     tilted real ground matches the antenna turned by hand over level ground
-    (to 1e-9); slope 0 is level ground.
+    (to 1e-9); slope 0 is level ground;
+  - terrain: a level profile is exactly level ground (also with buried
+    radials and over perfect ground); a long sloping profile matches the slope
+    model (0.05 dB, above the slope); a cliff profile agrees with the second
+    ground's cliff within 1.3 dB above 2° (horizontal dipole) and 2 dB above 4°
+    (vertical); a reflection under a distant ridge is the image's knife-edge
+    factor (the two-ray model); a high ridge cuts the low angles toward it by
+    13 to 18 dB and a hilltop raises them by 10 to 20 dB.
 
 No Python is needed to build, run or test the crate. The prototype in `python/`
 is a frozen reference: `python/tools/make_reference.py` regenerates the JSON if
@@ -316,6 +349,14 @@ These are the weaker spots, with how far they have been checked.
   reflecting near the antenna, but optimistic for low rays toward a valley,
   which in reality reflect from terrain far away. It can't yet be combined with
   a second ground medium.
+- **Terrain:** far field only, two-dimensional toward each bearing, one ground
+  for every facet, and not with a second ground medium. Near grazing (within a
+  few degrees) the edge treatments are approximate: at a cliff, terrain and the
+  second ground differ by up to 4 to 5 dB there. A ridge can raise the field at
+  the lowest angles by breaking up the ground reflection's cancellation
+  ("obstacle gain"), as it does in reality. The power budget
+  (`radiated_power`, `efficiency`) still uses the ground under the antenna.
+  Each direction costs about 0.2 ms with a 40-point profile.
 - **Not supported:** surfaces in or touching lossy ground, curved surfaces
   (other than as flat triangles), and NEC deck import/export (the application
   using this crate does that).

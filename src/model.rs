@@ -10,6 +10,7 @@
 
 use crate::farground::SecondGround;
 use crate::slope::{Frame, Slope};
+use crate::terrain::Terrain;
 use crate::kernel::{self, Kernel, PairIntegrals};
 use crate::lu;
 use crate::mesh::{self, AIR, Conductor, FALL, GROUND, Mesh, RISE, Surface, Wire};
@@ -324,6 +325,9 @@ pub struct Model {
     /// (see [`Slope`]).  Wires stay in world coordinates and must be above it.
     /// Not yet combined with a second ground medium.
     pub slope: Option<Slope>,
+    /// The terrain's height along each bearing, for the far field only (see
+    /// [`Terrain`]); needs a perfect or real ground.  Not with a second ground.
+    pub terrain: Option<Terrain>,
 }
 
 impl Model {
@@ -347,6 +351,7 @@ impl Model {
             kernel: Kernel::default(),
             end_caps: true,
             slope: None,
+            terrain: None,
         }
     }
 
@@ -968,6 +973,9 @@ impl Model {
         if self.sources.is_empty() {
             return Err(Error::new("the model has no source"));
         }
+        if self.terrain.is_some() && self.second_ground.is_some() && self.ground != Ground::Free {
+            return Err(Error::new("terrain and a second ground medium can't be combined"));
+        }
         if let Some((m, f)) = self.in_ground_frame()? {
             let mut sol = m.solve(freq)?;
             sol.frame = Some(f);
@@ -1009,6 +1017,7 @@ impl Model {
             second_ground: if self.ground == Ground::Free { None } else { self.second_ground },
             elements: OnceLock::new(),
             frame: None,
+            terrain: if self.ground == Ground::Free { None } else { self.terrain.clone() },
             losses: Losses::default(),
             t_fill_ms,
             t_solve_ms,
@@ -1195,6 +1204,8 @@ pub struct Solution {
     /// solved in.  `mesh` is in the ground frame; currents, elements and far-field
     /// directions are given in world coordinates.
     pub frame: Option<Frame>,
+    /// terrain for the far field (see [`Model::terrain`])
+    pub terrain: Option<Terrain>,
     /// power lost in the wires, loads and networks
     pub losses: Losses,
     /// notes about the geometry (see `Mesh::warnings`)
@@ -1352,12 +1363,21 @@ impl Solution {
     /// Over a sloping ground, directions are world ones (theta may then exceed 90°
     /// downhill) and the field is zero below the ground surface.
     pub fn far_field(&self, theta: f64, phi: f64) -> (C, C) {
-        let Some(f) = self.frame else { return self.far_field_local(theta, phi) };
+        if self.terrain.is_some() {
+            return self.far_field_terrain(theta, phi);
+        }
+        self.in_world(theta, phi, |t, p| self.far_field_local(t, p))
+    }
+
+    /// A field worked out in the ground frame by `f`, toward a world direction.
+    fn in_world(&self, theta: f64, phi: f64, f: impl Fn(f64, f64) -> (C, C)) -> (C, C) {
+        let Some(fr) = self.frame else { return f(theta, phi) };
         let (st, ct, sp, cp) = (theta.sin(), theta.cos(), phi.sin(), phi.cos());
-        let r = f.to_ground([st * cp, st * sp, ct]);
+        let r = fr.to_ground([st * cp, st * sp, ct]);
         let th_l = r[2].clamp(-1.0, 1.0).acos();
         let ph_l = r[1].atan2(r[0]);
-        let (et, ep) = self.far_field_local(th_l, ph_l);
+        let (et, ep) = f(th_l, ph_l);
+        let f = fr;
         // E = et θ̂' + ep φ̂' in the ground frame, projected on the world θ̂, φ̂
         let (sl, cl, spl, cpl) = (th_l.sin(), th_l.cos(), ph_l.sin(), ph_l.cos());
         let th_w = f.to_world([cl * cpl, cl * spl, -sl]);
@@ -1379,25 +1399,15 @@ impl Solution {
         if self.ground != Ground::Free && theta > PI / 2.0 + 1e-12 {
             return (C::new(0.0, 0.0), C::new(0.0, 0.0));
         }
-        let trans = match self.ground {
-            Ground::Real(g) if med.contains(&GROUND) => Some(sommerfeld::transmission(&g, self.freq, theta.min(PI / 2.0), phi)),
-            _ => None,
-        };
         let mut nd = [C::new(0.0, 0.0); 3];
         let mut ni = [C::new(0.0, 0.0); 3];
         // second medium: images weighted per element by each medium's share of its
         // reflection (`ni` then holds medium 1's, `ni2` medium 2's)
         let mut ni2 = [C::new(0.0, 0.0); 3];
         let ray = self.second_ground.map(|_| crate::farground::Ray::new(PI / 2.0 - theta.min(PI / 2.0), phi, k));
-        let (mut et_b, mut ep_b) = (C::new(0.0, 0.0), C::new(0.0, 0.0));
         for ((p, c), &md) in els.iter().zip(med) {
             if md == GROUND {
-                // buried current: transmitted through the surface (by reciprocity)
-                let (t_te, t_tm, e, kz2) = trans.unwrap();
-                let phase = C::from_polar(1.0, k * st * (cp * p[0] + sp * p[1])) * (C::new(0.0, -1.0) * kz2 * (-p[2])).exp();
-                et_b += t_tm * (e[0] * c[0] + e[1] * c[1] + e[2] * c[2]) * phase;
-                ep_b += t_te * (ph[0] * c[0] + ph[1] * c[1]) * phase;
-                continue;
+                continue; // see `buried_local`
             }
             if self.ground == Ground::Free {
                 let ph_d = C::from_polar(1.0, k * dot(rhat, *p));
@@ -1440,8 +1450,9 @@ impl Solution {
             Ground::Perfect => (C::new(-1.0, 0.0), C::new(1.0, 0.0)),
             Ground::Real(g) => g.reflection(self.freq, theta.min(PI / 2.0)),
         };
-        e_th += g_tm * pref * proj(&ni, th) + pref * et_b;
-        e_ph += -g_te * pref * proj(&ni, ph) + pref * ep_b;
+        let (et_b, ep_b) = self.buried_local(theta, phi);
+        e_th += g_tm * pref * proj(&ni, th) + et_b;
+        e_ph += -g_te * pref * proj(&ni, ph) + ep_b;
         if let Some(sg) = &self.second_ground {
             // medium 2's surface is `drop` lower: its image is 2 drop further down
             let (t2, m2) = sg.ground.reflection(self.freq, theta.min(PI / 2.0));
@@ -1450,6 +1461,111 @@ impl Solution {
             e_ph += -t2 * shift * pref * proj(&ni2, ph);
         }
         (e_th, e_ph)
+    }
+
+    /// The far field of the currents in the ground, transmitted through the surface
+    /// (by reciprocity), in the ground frame; zero without any.
+    fn buried_local(&self, theta: f64, phi: f64) -> (C, C) {
+        let zero = (C::new(0.0, 0.0), C::new(0.0, 0.0));
+        let (els, med) = self.elements.get_or_init(|| self.far_elements());
+        let Ground::Real(g) = self.ground else { return zero };
+        if !med.contains(&GROUND) || theta > PI / 2.0 + 1e-12 {
+            return zero;
+        }
+        let k = 2.0 * PI * self.freq / C0;
+        let (st, sp, cp) = (theta.sin(), phi.sin(), phi.cos());
+        let ph = [-sp, cp, 0.0];
+        let (t_te, t_tm, e, kz2) = sommerfeld::transmission(&g, self.freq, theta.min(PI / 2.0), phi);
+        let (mut et_b, mut ep_b) = zero;
+        for ((p, c), &md) in els.iter().zip(med) {
+            if md != GROUND {
+                continue;
+            }
+            let phase = C::from_polar(1.0, k * st * (cp * p[0] + sp * p[1])) * (C::new(0.0, -1.0) * kz2 * (-p[2])).exp();
+            et_b += t_tm * (e[0] * c[0] + e[1] * c[1] + e[2] * c[2]) * phase;
+            ep_b += t_te * (ph[0] * c[0] + ph[1] * c[1]) * phase;
+        }
+        let pref = C::new(0.0, -2.0 * PI * self.freq * MU0 / (4.0 * PI));
+        (pref * et_b, pref * ep_b)
+    }
+
+    /// The far field over terrain (world directions): the direct field of the
+    /// currents in the air, cut by ridges in front, plus each facet's reflection;
+    /// buried currents radiate through the ground under the antenna as without
+    /// terrain.  Nothing at or below the horizon.
+    fn far_field_terrain(&self, theta: f64, phi: f64) -> (C, C) {
+        let zero = (C::new(0.0, 0.0), C::new(0.0, 0.0));
+        let terrain = self.terrain.as_ref().unwrap();
+        let psi = PI / 2.0 - theta;
+        if psi <= 1e-9 {
+            return zero;
+        }
+        let k = 2.0 * PI * self.freq / C0;
+        let (st, ct, sp, cp) = (theta.sin(), theta.cos(), phi.sin(), phi.cos());
+        let rhat = [st * cp, st * sp, ct];
+        let th = [ct * cp, ct * sp, -st];
+        let ph = [-sp, cp, 0.0];
+        let ehat = [cp, sp, 0.0];
+        let cut = terrain.cut(phi);
+        let (els, med) = self.elements.get_or_init(|| self.far_elements());
+        let world = |v: V3| self.frame.map_or(v, |f| f.to_world(v));
+        // per facet: its normal in 3-D and its reflection coefficients at the ray's
+        // grazing angle to it (the same for every element)
+        let coef = |graze: f64| match self.ground {
+            // (past the facet's normal, graze > 90°: the same angle from it)
+            Ground::Real(g) => g.reflection(self.freq, (PI / 2.0 - graze).abs()),
+            _ => (C::new(-1.0, 0.0), C::new(1.0, 0.0)),
+        };
+        let normals: Vec<V3> = cut
+            .facets
+            .iter()
+            .map(|f| {
+                let n = f.normal();
+                [n[0] * ehat[0], n[0] * ehat[1], n[1]]
+            })
+            .collect();
+        let mut nd = [C::new(0.0, 0.0); 3];
+        // image sums per facet, already weighted by TE / TM coefficients:
+        // (theta part, phi part)
+        let (mut e_img_t, mut e_img_p) = (C::new(0.0, 0.0), C::new(0.0, 0.0));
+        let proj = |v: [C; 3], u: V3| v[0] * u[0] + v[1] * u[1] + v[2] * u[2];
+        for ((pl, cl), &md) in els.iter().zip(med) {
+            if md == GROUND {
+                continue;
+            }
+            let p = world(*pl);
+            let c: [C; 3] = if self.frame.is_some() {
+                let re = world(cl.map(|x| x.re));
+                let im = world(cl.map(|x| x.im));
+                [0, 1, 2].map(|i| C::new(re[i], im[i]))
+            } else {
+                *cl
+            };
+            let (s, z) = (dot(p, ehat), p[2]);
+            let d = cut.direct(s, z, psi, k) * C::from_polar(1.0, k * dot(rhat, p));
+            for i in 0..3 {
+                nd[i] += c[i] * d;
+            }
+            for (fi, f) in cut.facets.iter().enumerate() {
+                let Some((w, graze)) = cut.share(fi, s, z, psi, k) else { continue };
+                if w.norm() < 1e-12 {
+                    continue;
+                }
+                let n = normals[fi];
+                let q = [f.q[0] * ehat[0], f.q[0] * ehat[1], f.q[1]];
+                let pm = sub(p, scale(n, 2.0 * dot(sub(p, q), n)));
+                // image current: -(c mirrored in the facet)
+                let cn = c[0] * n[0] + c[1] * n[1] + c[2] * n[2];
+                let ci = [0, 1, 2].map(|i| -(c[i] - cn * (2.0 * n[i])));
+                let v = ci.map(|x| x * (w * C::from_polar(1.0, k * dot(rhat, pm))));
+                let (g_te, g_tm) = coef(graze);
+                e_img_t += g_tm * proj(v, th);
+                e_img_p += -g_te * proj(v, ph);
+            }
+        }
+        let pref = C::new(0.0, -2.0 * PI * self.freq * MU0 / (4.0 * PI));
+        let (et_b, ep_b) = self.in_world(theta, phi, |t, p| self.buried_local(t, p));
+        (pref * (proj(nd, th) + e_img_t) + et_b, pref * (proj(nd, ph) + e_img_p) + ep_b)
     }
 
     /// Power gain toward (theta from zenith, phi), linear; includes wire, load and
