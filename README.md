@@ -181,8 +181,11 @@ this wire and the junction.
    shapes the far field; the currents still see the ground under the antenna.
    Toward each bearing the terrain is taken as two-dimensional. Every facet
    reflects with its own image and Fresnel coefficients at the ray's grazing
-   angle to it, weighted by the physical-optics integral over its lit part
-   (as the second ground's transition). Ridges in front cut the direct ray and,
+   angle to it, weighted by the physical-optics integral over its lit part: a
+   Fresnel integral taken at the exact path difference, with the endpoint
+   amplitude, spreading and obliquity of a point source over the facet. Where
+   two facets meet, their edge terms then cancel as on a continuous surface, so
+   a gently curving profile gives a smooth pattern. Ridges in front cut the direct ray and,
    seen from the image, the reflected rays as knife edges: the exact Fresnel
    factor where a ridge blocks the ray, and ITU-R P.526's smooth loss where it
    only comes close (the exact factor's ripple there would count the ridge's
@@ -272,8 +275,9 @@ this wire and the junction.
   - terrain: a level profile is exactly level ground (also with buried
     radials and over perfect ground); a long sloping profile matches the slope
     model (0.05 dB, above the slope); a cliff profile agrees with the second
-    ground's cliff within 1.3 dB above 2° (horizontal dipole) and 2 dB above 4°
-    (vertical); a reflection under a distant ridge is the image's knife-edge
+    ground's cliff within 1.2 dB above 4° (horizontal dipole) and 1.5 dB above
+    6° (vertical); a profile curving 0.1° more every 50 m gives a pattern as
+    smooth as a single bend's; a reflection under a distant ridge is the image's knife-edge
     factor (the two-ray model); a high ridge cuts the low angles toward it by
     13 to 18 dB and a hilltop raises them by 10 to 20 dB.
 
@@ -352,7 +356,8 @@ These are the weaker spots, with how far they have been checked.
 - **Terrain:** far field only, two-dimensional toward each bearing, one ground
   for every facet, and not with a second ground medium. Near grazing (within a
   few degrees) the edge treatments are approximate: at a cliff, terrain and the
-  second ground differ by up to 4 to 5 dB there. A ridge can raise the field at
+  second ground differ by up to 9 dB at 1° (the second ground's quadratic phase
+  underrates the edge there). A ridge can raise the field at
   the lowest angles by breaking up the ground reflection's cancellation
   ("obstacle gain"), as it does in reality. The power budget
   (`radiated_power`, `efficiency`) still uses the ground under the antenna.

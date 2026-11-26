@@ -15,9 +15,12 @@
 //! * every facet reflects with its own image (mirrored in the facet's plane) and
 //!   Fresnel coefficients at the ray's grazing angle to the facet.  As in
 //!   [`crate::farground`], the facet's share of the reflection is the
-//!   physical-optics integral over its lit part: `F(nu_a) - F(nu_b)`, with
-//!   `nu` the lit part's ends measured from the specular point in Fresnel-zone
-//!   units.  The lit part is the facet less what ridges between the element and
+//!   physical-optics integral over its lit part, `F(nu_a) - F(nu_b)`.  Here `nu`
+//!   comes from the exact path difference via each end, not the quadratic one
+//!   about the specular point, and far from it the term takes the true endpoint
+//!   amplitude (with the field's spreading and the incidence's obliquity).  Two
+//!   facets meeting at a join then give it the same phase, and their terms cancel
+//!   as on a continuous surface.  The lit part is the facet less what ridges between the element and
 //!   the facet hide from it.  Ridges beyond the facet cut the reflected ray as a
 //!   knife edge, seen from the image (the two-ray model of diffraction over
 //!   ground).  A level profile gives exactly the level-ground reflection;
@@ -307,15 +310,49 @@ impl Cut {
         // Fresnel-zone scale along the facet at the specular point (curvature
         // s³/h of the path difference, as in farground)
         let sg = graze.sin();
-        let scale = (k * sg * sg * sg / (h * PI)).sqrt();
+        let curv = sg * sg * sg / h;
+        // the path length via the facet's point u (element to it, then out toward
+        // psi), less its value at the specular point, and its slope along u
+        let w2 = [psi.cos(), psi.sin()];
+        let path = |u: f64| {
+            let x = [f.q[0] + u * f.t[0], f.q[1] + u * f.t[1]];
+            let d = sub2(x, e);
+            let r = d[0].hypot(d[1]);
+            (r - dot2(w2, x), dot2(d, f.t) / r - dot2(w2, f.t), r)
+        };
+        let (path_spec, _, rho_spec) = path(u_spec);
+        // the share of the reflection beyond u: the Fresnel integral, taken at the
+        // exact path difference (nu = sqrt(2 k dPhi / pi), signed), so its phase is
+        // right however far u is from the specular point, and scaled toward the true
+        // endpoint amplitude 1 / (k Phi') with the field falling as 1/sqrt(distance)
+        // (a point source over ground that is the same across the ray) and with the
+        // incidence's obliquity.  Near the
+        // specular point this is the plain Fresnel integral.  With the exact phase,
+        // two facets meeting at a join give it the same phase, and their terms cancel
+        // as on a continuous surface (the quadratic phase about each facet's own
+        // specular point goes wrong far from it, and joins are often far from it).
+        let norm = (2.0 * PI / (k * curv)).sqrt();
         let tail = |u: f64| {
             if u == f64::NEG_INFINITY {
-                C::new(1.0, 0.0)
-            } else if u == f64::INFINITY {
-                C::new(0.0, 0.0)
-            } else {
-                fresnel_tail((u - u_spec) * scale)
+                return C::new(1.0, 0.0);
             }
+            if u == f64::INFINITY {
+                return C::new(0.0, 0.0);
+            }
+            let (p, dp, rho) = path(u);
+            let dphi = (p - path_spec).max(0.0);
+            let nu = (2.0 * k * dphi / PI).sqrt().copysign(u - u_spec);
+            if nu.abs() < 1e-6 {
+                return fresnel_tail(nu);
+            }
+            let step = if u < u_spec { C::new(1.0, 0.0) } else { C::new(0.0, 0.0) };
+            // obliquity: the surface current there is weaker as the incoming ray
+            // meets the facet at a shallower angle (h / rho, against h / rho_spec at
+            // the specular point), so a facet seen at grazing incidence fades out
+            // instead of leaving its neighbours' join terms unbalanced
+            let obliquity = rho_spec / rho;
+            let kappa = (obliquity * (rho_spec / rho).sqrt() * PI * nu * 2f64.sqrt() / (k * dp * norm)).clamp(0.0, 10.0);
+            step + (fresnel_tail(nu) - step) * kappa
         };
         // ridges beyond the facet: the reflected ray leaves as from the image (the
         // element mirrored in the facet) and passes them as a knife edge (the

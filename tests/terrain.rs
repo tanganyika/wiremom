@@ -82,8 +82,10 @@ fn endless_slope_matches_the_slope_model() {
 #[test]
 fn cliff_agrees_with_the_second_ground() {
     // a 10 m drop 40 m out, the same soil above and below; the two models treat
-    // the edge differently (they part most within a few degrees of grazing)
-    for (vertical, from, tol) in [(false, 2.0, 1.5), (true, 4.0, 2.0)] {
+    // the edge differently (measured: 1.2 dB above 4° for a horizontal dipole,
+    // 1.5 dB above 6° for a vertical; near grazing they part by up to 9 dB, where
+    // the second ground's quadratic phase underrates the edge)
+    for (vertical, from, tol) in [(false, 4.0, 1.5), (true, 6.0, 1.8)] {
         let w = if vertical { Wire::new([0.0, 0.0, 4.7], [0.0, 0.0, 15.2], 0.002, 21) } else { Wire::new([0.0, -5.25, 10.0], [0.0, 5.25, 10.0], 0.002, 21) };
         let mut sg = Model::new(vec![w], Ground::Real(RealGround::AVERAGE));
         sg.add_source(0, 11, C::new(1.0, 0.0));
@@ -151,3 +153,34 @@ fn terrain_and_second_ground_are_refused_together() {
     m.second_ground = Some(SecondGround::new(RealGround::SEA_WATER, Boundary::Circle { radius: 100.0 }));
     assert!(m.solve(F).is_err());
 }
+
+/// Mean and largest |second difference| of the gain (dB) toward +x over 0.25° steps.
+fn roughness(m: &Model, lo: f64, hi: f64) -> (f64, f64) {
+    let s = m.solve(F).unwrap();
+    let g: Vec<f64> = (0..=((hi - lo) * 4.0) as usize).map(|i| s.gain_dbi(el(lo + i as f64 * 0.25), 0.0)).collect();
+    let d2: Vec<f64> = g.windows(3).map(|w| (w[0] - 2.0 * w[1] + w[2]).abs()).collect();
+    (d2.iter().sum::<f64>() / d2.len() as f64, d2.iter().cloned().fold(0.0, f64::max))
+}
+
+/// A gently curving profile (0.1° more fall every 50 m) is nearly level: its
+/// pattern stays as smooth as a single bend's.  Each facet's edge terms take the
+/// exact path phase and fade with the incidence's obliquity, so neighbouring
+/// facets' terms cancel at their joins (with the Fresnel integral's quadratic
+/// phase alone, this pattern was jagged: 2.8 dB mean second difference).
+#[test]
+fn gently_curving_profile_is_smooth() {
+    let mut m = dipole(Ground::Real(RealGround::AVERAGE));
+    let fall = 0.1f64.to_radians().tan();
+    m.terrain = Some(Terrain::uniform((0..20).map(|i| [i as f64 * 50.0, -(i * i) as f64 * 50.0 * fall / 2.0]).collect()));
+    let (low, _) = roughness(&m, 1.0, 20.0);
+    let (high, high_max) = roughness(&m, 20.0, 80.0);
+    println!("curving: 1-20° mean {low:.3} | 20-80° mean {high:.3} max {high_max:.3}");
+    assert!(low < 0.1 && high < 0.02 && high_max < 0.05);
+    // the same total fall as one bend
+    let total = 19.0 * 0.1f64.to_radians();
+    m.terrain = Some(Terrain::uniform(vec![[0.0, 0.0], [50.0, 0.0], [950.0, -900.0 * total.tan()]]));
+    let (low1, _) = roughness(&m, 1.0, 20.0);
+    let (high1, _) = roughness(&m, 20.0, 80.0);
+    assert!(low1 < 0.1 && high1 < 0.02);
+}
+
