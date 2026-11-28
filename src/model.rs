@@ -330,6 +330,93 @@ pub struct Model {
     pub terrain: Option<Terrain>,
 }
 
+/// Currents through the surface of real ground.  The closed-form (quasi-static)
+/// scalar potentials the matrix is built from are not continuous across the
+/// surface: a charge in the soil is seen with the ground's wavenumber from below and
+/// with the air's from above, so at a point of the surface the two differ by
+/// `J = (1 - Γ0)/(jωε0) · q · (e^{-jk0 R} - e^{-jkg R})/(4πR)`.  The tabulated
+/// remainders are fields and cannot restore a potential, and the potential form of
+/// the Galerkin integral assumes it is continuous along each testing function, so a
+/// basis whose current passes through the surface picked up `-J` from every source
+/// with charge in the soil (checked entry by entry against an E-field Galerkin with
+/// the exact half-space fields).  For a vertical rod through a lossless dielectric
+/// ground that made the crossing basis' self-resistance `-(η0/4π)·2(√ε-1)/(ε+1)`
+/// (-11 Ω for ε = 13), and with shallow radials the input resistance of a short
+/// vertical went negative.  This adds `u Jᵀ + J uᵀ - u uᵀ J_x`, with `u` the
+/// bases' currents through each crossing node (soil to air), `J` the jump each
+/// basis' soil charge makes there, and `J_x = Σ u J` (so the crossing basis' own
+/// term is added once).
+fn surface_crossing_terms(m: &Mesh, z: &mut [C], nb: usize, k_air: C, k_ground: C, scale: C) {
+    let (x, w) = gauss01(8);
+    let n_nodes = m.nodes.len();
+    let mut touches = vec![(false, false); n_nodes];
+    for s in 0..m.n_segments() {
+        for &nd in &m.seg_nodes[s] {
+            if m.nodes[nd][2].abs() <= 1e-9 * (1.0 + m.len[s]) {
+                if m.medium[s] == GROUND { touches[nd].1 = true } else { touches[nd].0 = true }
+            }
+        }
+    }
+    for c in (0..n_nodes).filter(|&nd| touches[nd] == (true, true)) {
+        let pc = m.nodes[c];
+        // each basis' current through the crossing, soil to air (leaving c into the air)
+        let u: Vec<f64> = m
+            .basis
+            .iter()
+            .map(|b| {
+                b.halves
+                    .iter()
+                    .filter(|h| m.medium[h.seg] == AIR)
+                    .map(|h| {
+                        let [s0, s1] = m.seg_nodes[h.seg];
+                        if s0 == c && h.shape == FALL {
+                            h.c
+                        } else if s1 == c && h.shape == RISE {
+                            -h.c
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum()
+            })
+            .collect();
+        if u.iter().all(|&v| v == 0.0) {
+            continue;
+        }
+        // the jump each basis' soil charge makes at the crossing
+        let jump: Vec<C> = m
+            .basis
+            .iter()
+            .map(|b| {
+                let mut s = C::new(0.0, 0.0);
+                for h in b.halves.iter().filter(|h| m.medium[h.seg] == GROUND) {
+                    let l = m.len[h.seg];
+                    for (xi, wi) in x.iter().zip(w) {
+                        let r = norm(sub(pc, along(m.p0[h.seg], m.t[h.seg], xi * l))).max(1e-12);
+                        let j = C::new(0.0, -1.0);
+                        // e^{-jk0 r} - e^{-jkg r} without cancellation for small r
+                        let d = kernel::expm1(j * k_air * r) - kernel::expm1(j * k_ground * r);
+                        s += d / (4.0 * PI * r) * (h.div / l * wi * l);
+                    }
+                }
+                scale * s
+            })
+            .collect();
+        let jx: C = u.iter().zip(&jump).map(|(a, b)| b * *a).sum();
+        let crossing: Vec<usize> = (0..u.len()).filter(|&i| u[i] != 0.0).collect();
+        for &a in &crossing {
+            for bb in 0..u.len() {
+                // u_a J_b and its transpose; the u u^T J_x part only among crossing bases
+                z[a * nb + bb] += jump[bb] * u[a];
+                z[bb * nb + a] += jump[bb] * u[a];
+            }
+            for &bb in &crossing {
+                z[a * nb + bb] -= jx * (u[a] * u[bb]);
+            }
+        }
+    }
+}
+
 impl Model {
     pub fn new(wires: Vec<Wire>, ground: Ground) -> Model {
         Model {
@@ -675,6 +762,11 @@ impl Model {
                     z[ma * nb + nb_] += w * (ha.div * hb.div);
                 }
             }
+        }
+
+        // currents through the ground surface (see `surface_crossing_terms`)
+        if matches!(self.ground, Ground::Real(_)) && !air.is_empty() && !gnd.is_empty() {
+            surface_crossing_terms(m, &mut z, nb, k, k_ground, inv_jweps * (1.0 - g0));
         }
 
         // lumped loads across gaps; open circuits as a penalty forcing the gap current to 0

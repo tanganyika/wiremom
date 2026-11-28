@@ -225,14 +225,25 @@ this wire and the junction.
     (`python/tools/near_ground_reference.py`): within 1.2% in the complex
     propagation constant, also with segments 250 times the wire's height;
   - the field transmitted into the ground matches an independent derivation from
-    the Fresnel coefficients to 1e-5;
+    the Fresnel coefficients to 1e-5 (all five components), and so do the
+    reflected fields on both sides;
+  - a current through the surface: the matrix entries of a vertical rod through
+    the ground match an E-field Galerkin with those fields, and the rod's
+    crossing basis has only radiation resistance over a lossless dielectric
+    ground (it used to have -11 Ω at ε = 13, from closed-form potentials that
+    jump at the surface; a short vertical over shallow radials then had a
+    negative input resistance);
+  - a cross-section of the wire (`python/tools/xsec`): its near field moved from
+    3 mm above to 3 mm below the surface, put into the model of a 20 m vertical
+    with 16 radials, gives what the model with buried radials gives (25.8%
+    efficiency);
   - with a transparent "ground" (ε = 1, σ = 0), buried, surface-crossing and
     coupled wires reproduce free space exactly;
   - the transmitted field matches the free field through a transparent ground,
     and its quasi-static part matches its closed form;
   - the reflection seen from inside the ground, with perfect-conductor
     coefficients, reproduces the image field with the complex ground wavenumber;
-  - two 2 m ground rods at 10 kHz: 89.2 Ω, against 89.8 Ω from Dwight's
+  - two 2 m ground rods at 10 kHz: 88.5 Ω, against 89.8 Ω from Dwight's
     formula;
   - the matrix stays symmetric (1.8e-5) with wires on both sides;
   - buried radials: more radials raise a vertical's efficiency;
@@ -240,8 +251,11 @@ this wire and the junction.
     integration (to under 2% and 0.5% point by point, out to grazing angles in
     sea water), and tabulated couplings change a radial system's impedance by
     about 1e-6 (`--example crosscheck`);
-  - a quarter-wave vertical over 16 radials in sea water gives 38 Ω at 86%
-    efficiency.
+  - a quarter-wave vertical over 16 radials in sea water gives 39 Ω at 86%
+    efficiency;
+  - over 32 buried radials in average ground, a vertical's efficiency rises
+    steadily with radial length and levels off (23% at 2 m, 31% at 5 m, 34% at
+    10 m, 14.15 MHz).
 - **Surfaces:**
   - the analytic triangle integrals match brute force and a closed form;
   - a lossless dipole or monopole with a plate radiates exactly its input power;
@@ -340,7 +354,7 @@ These are the weaker spots, with how far they have been checked.
   ground or thin plates, so those are validated by exact limits, closed forms,
   energy conservation, symmetry and classic results instead:
   - **Wires in the ground:** a transparent ground reproduces free space,
-    Dwight's ground-rod formula matches within 0.7%, and the guided wave on wires
+    Dwight's ground-rod formula matches within 1.5%, and the guided wave on wires
     just above, just below and deeper in the ground and the field transmitted
     through the surface match independent derivations. Whole antennas (radial
     systems) are not yet compared with NEC-4/5 or measurements.

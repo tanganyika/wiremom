@@ -1,0 +1,9 @@
+[package]
+name = "eff"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+wiremom = { path = "../../../.."  # apply extra_p-experiment.patch first }
+num-complex = "0.4"
+[profile.release]
+opt-level = 3

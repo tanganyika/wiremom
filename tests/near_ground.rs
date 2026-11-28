@@ -75,3 +75,36 @@ fn transmitted_field_matches_an_independent_derivation() {
         }
     }
 }
+
+#[test]
+fn current_through_the_surface_is_passive() {
+    // A vertical rod through a lossless dielectric ground: the basis whose current
+    // passes through the surface used to have a self-resistance of
+    // -(eta0/4 pi) 2(sqrt(eps)-1)/(eps+1) (-11 ohm at eps 13), from closed-form
+    // potentials that jump at the surface.  Its resistance is only radiation now.
+    let f = 14.15e6;
+    for eps_r in [2.0, 4.0, 13.0, 81.0] {
+        let m = Model::new(vec![Wire::new([0.0, 0.0, -0.2], [0.0, 0.0, 0.2], 0.0005, 8)], Ground::Real(RealGround { eps_r, sigma: 0.0 }));
+        let mesh = m.mesh().unwrap();
+        let z = m.impedance_matrix(&mesh, f).unwrap();
+        let nb = mesh.n_unknowns();
+        let b = (0..nb).find(|&b| mesh.nodes[mesh.basis[b].node][2].abs() < 1e-12).unwrap();
+        let r = z[b * nb + b].re;
+        println!("eps {eps_r}: crossing basis self-resistance {r:.4} ohm");
+        assert!(r > 0.0 && r < 0.1, "eps {eps_r}: {r}");
+    }
+    // a short vertical fed just above the surface over shallow buried radials: the
+    // input resistance went negative with 8 or more radials
+    for n in [4usize, 16, 32] {
+        let mut w = vec![Wire::new([0.0, 0.0, -0.003], [0.0, 0.0, 0.3], 0.005, 6)];
+        for i in 0..n {
+            let t = 2.0 * PI * i as f64 / n as f64;
+            w.push(Wire::new([0.0, 0.0, -0.003], [0.5 * t.cos(), 0.5 * t.sin(), -0.003], 0.0005, 4));
+        }
+        let mut m = Model::new(w, Ground::Real(RealGround::AVERAGE));
+        m.add_source(0, 1, C::new(1.0, 0.0));
+        let z = m.solve(f).unwrap().input_impedance();
+        println!("{n} radials 3 mm deep: Z = {z:.2}");
+        assert!(z.re > 1.0, "{n} radials: {z}");
+    }
+}

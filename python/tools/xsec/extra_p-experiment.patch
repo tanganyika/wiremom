@@ -1,0 +1,37 @@
+--- a/src/mesh.rs	2026-11-14 19:37:36.768424511 +0000
++++ b/src/mesh.rs	2026-11-28 14:57:24.394359440 +0000
+@@ -62,11 +62,14 @@
+     pub series_l_per_m: f64,
+     /// A dielectric sleeve (see [`Insulation`]).
+     pub insulation: Option<Insulation>,
++    /// EXPERIMENT: extra near-field potential per unit charge, units 1/(2 pi eps0),
++    /// from a 2-D cross-section solve (e.g. a wire resting on the soil).
++    pub extra_p: num_complex::Complex64,
+ }
+ 
+ impl Wire {
+     pub fn new(start: V3, end: V3, radius: f64, nseg: usize) -> Wire {
+-        Wire { start, end, radius, segments: Segments::Uniform(nseg), conductor: Conductor::Perfect, series_l_per_m: 0.0, insulation: None }
++        Wire { start, end, radius, segments: Segments::Uniform(nseg), conductor: Conductor::Perfect, series_l_per_m: 0.0, insulation: None, extra_p: num_complex::Complex64::new(0.0, 0.0) }
+     }
+     pub fn with_conductor(mut self, c: Conductor) -> Wire {
+         self.conductor = c;
+--- a/src/model.rs	2026-11-28 15:42:45.521245334 +0000
++++ b/src/model.rs	2026-11-28 15:41:14.733107827 +0000
+@@ -749,6 +749,16 @@
+         // insulation: a local charge term on each sleeved segment (see mesh::Insulation),
+         // with the permittivity of the medium the segment is in
+         for s in 0..n {
++            let xp = self.wires[m.wire_of_seg[s]].extra_p;
++            if xp != C::new(0.0, 0.0) {
++                let w = inv_jweps * (xp / (2.0 * PI)) / m.len[s];
++                for &(ma, ia) in &on_seg[s] {
++                    for &(nb_, ib) in &on_seg[s] {
++                        let (ha, hb) = (m.basis[ma].halves[ia], m.basis[nb_].halves[ib]);
++                        z[ma * nb + nb_] += w * (ha.div * hb.div);
++                    }
++                }
++            }
+             let Some(ins) = self.wires[m.wire_of_seg[s]].insulation else { continue };
+             if !(ins.thickness > 0.0 && ins.eps_r > 0.0) {
+                 continue;
