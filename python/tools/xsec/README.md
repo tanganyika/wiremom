@@ -15,6 +15,7 @@ venv/bin/pip install gmsh scikit-fem`.
 | `check_xsec.py` | Checks `xsec.py` against image theory (two heights over soil) and the coax formula (insulation), and that results don't depend on the outer boundary |
 | `guided.py` | Guided-mode equation of one wire, or two parallel wires in phase, near lossy ground (2-D spectral form, oscillatory integrals by QUADPACK's QAWF) |
 | `wave_cases.py` | The guided wave along a radial above, resting on (5–50% of its circumference in the soil) and under the soil, bare and PVC, corrected from bare filaments 3 mm above and below the surface |
+| `resting_antenna.py` | A 20 m vertical with 16 radials (3 m and 5 m, bare or PVC) above, resting on and in the soil: impedance and efficiency, from both references; results in `resting_antenna.json` |
 | `extra_p-experiment.patch`, `eff-runner/` | Experiment: `Wire::extra_p`, a per-wire near-field correction in wiremom, and a runner for a 20 m vertical with radials |
 
 ## Method
