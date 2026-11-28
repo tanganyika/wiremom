@@ -217,8 +217,15 @@ this wire and the junction.
 - **Sommerfeld integrals** at 49 points over 7 soil and water types, matching
   the prototype to 1e-9. With perfect-conductor coefficients they also reproduce
   the closed-form image field.
-- **Wires in the ground** (no other code is available to compare against —
-  nec2c can't model them — so the checks are exact limits and classic results):
+- **Wires near and in the ground** (nec2c can't model buried wires, so the
+  checks are independent derivations, exact limits and classic results):
+  - the guided wave along a long wire parallel to average ground, from 0.1 m up
+    to 0.1 m down and 2 mm (two radii) either side of the surface, matches the
+    modal equation of an infinite wire, solved separately in a 2-D spectral form
+    (`python/tools/near_ground_reference.py`): within 1.2% in the complex
+    propagation constant, also with segments 250 times the wire's height;
+  - the field transmitted into the ground matches an independent derivation from
+    the Fresnel coefficients to 1e-5;
   - with a transparent "ground" (ε = 1, σ = 0), buried, surface-crossing and
     coupled wires reproduce free space exactly;
   - the transmitted field matches the free field through a transparent ground,
@@ -332,9 +339,11 @@ These are the weaker spots, with how far they have been checked.
 - **No independent reference for some features.** nec2c can't model wires in the
   ground or thin plates, so those are validated by exact limits, closed forms,
   energy conservation, symmetry and classic results instead:
-  - **Wires in the ground:** a transparent ground reproduces free space, and
-    Dwight's ground-rod formula matches within 0.7%. Not compared with NEC-4 or
-    measurements.
+  - **Wires in the ground:** a transparent ground reproduces free space,
+    Dwight's ground-rod formula matches within 0.7%, and the guided wave on wires
+    just above, just below and deeper in the ground and the field transmitted
+    through the surface match independent derivations. Whole antennas (radial
+    systems) are not yet compared with NEC-4/5 or measurements.
   - **Wire-to-surface junctions:** the plate model converges as the mesh is
     refined, to 39.9 Ω for a λ/4 monopole on a 1 λ plate, and energy is
     conserved. An equivalent wire grid differs by up to ~8%, approaching the

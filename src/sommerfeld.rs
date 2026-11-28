@@ -512,6 +512,75 @@ fn galerkin(
     acc.map(|r| r.map(|v| v * l))
 }
 
+/// Wires close to the surface (height above or depth below it small against the
+/// segment length): the remainder field then varies on the scale of the distance
+/// to the image, `h = |z_p| + |z_q|`, not of the segment, and a fixed Gauss rule
+/// misses it (a wire 2 mm above average ground cut into 0.25 m segments came out
+/// with an 18% slower guided wave).  This gives `h` for the pairs that need a
+/// graded rule: both segments level enough that `h` holds along them, within a
+/// segment length of each other, and longer than 4 h.
+fn graded_height(m: &Mesh, p: usize, q: usize, mid_p: V3, mid_q: V3) -> Option<f64> {
+    let h = mid_p[2].abs() + mid_q[2].abs();
+    let l = m.len[p].max(m.len[q]);
+    let level = |s: usize, mid: V3| (m.t[s][2] * m.len[s]).abs() < 0.5 * mid[2].abs();
+    let gap = norm(sub(mid_p, mid_q)) - 0.5 * (m.len[p] + m.len[q]);
+    (l > 4.0 * h && gap < l && level(p, mid_p) && level(q, mid_q)).then_some(h)
+}
+
+/// Gauss points on [0, 1] graded geometrically (ratio about 3) away from `at` on
+/// each side, the first interval `first` long: (x, weight).
+fn graded01(at: f64, first: f64, n_pts: usize, out: &mut Vec<(f64, f64)>) {
+    let at = at.clamp(0.0, 1.0);
+    for (len, sign) in [(at, -1.0), (1.0 - at, 1.0)] {
+        if len <= 1e-12 {
+            continue;
+        }
+        let n_sub = if len > first { ((len / first).ln() / 3f64.ln()).ceil() as usize + 1 } else { 1 };
+        let mut part = Vec::new();
+        crate::quad::composite(0.0, len, n_sub, n_pts, Some(first), &mut part);
+        out.extend(part.into_iter().map(|(x, w)| (at + sign * x, w)));
+    }
+}
+
+/// [`galerkin`] for a pair close to the surface (see [`graded_height`]): the test
+/// points graded toward both ends of the test segment (where the source's peak
+/// meets the end of its range), and each source integral graded toward the
+/// observer's nearest point on the source segment.
+fn galerkin_graded(m: &Mesh, p: usize, q: usize, h: f64, n_q: usize, mut field: impl FnMut(V3, V3, f64) -> [C; 5]) -> [[C; 2]; 2] {
+    let (tp, tq) = (m.t[p], m.t[q]);
+    let (lp, lq) = (m.len[p], m.len[q]);
+    let n_pts = n_q.clamp(2, 4);
+    let mut outer = Vec::new();
+    graded01(0.5, 0.5 * h / lp, n_pts, &mut outer);
+    // graded01 grades away from 0.5; mirror each half so it grades toward the ends
+    for o in outer.iter_mut() {
+        o.0 = if o.0 < 0.5 { 0.5 - o.0 } else { 1.5 - o.0 };
+    }
+    let mut acc = [[C::new(0.0, 0.0); 2]; 2];
+    let mut inner_pts = Vec::new();
+    for &(xo, wo) in &outer {
+        let r = along(m.p0[p], tp, xo * lp);
+        inner_pts.clear();
+        graded01(dot(sub(r, m.p0[q]), tq) / lq, 0.5 * h / lq, n_pts, &mut inner_pts);
+        let mut inner = [C::new(0.0, 0.0); 2];
+        for &(xs, ws) in &inner_pts {
+            let s = along(m.p0[q], tq, xs * lq);
+            let (dx, dy) = (r[0] - s[0], r[1] - s[1]);
+            let rho = (dx * dx + dy * dy).sqrt();
+            let (cx, cy) = if rho > 1e-12 * (1.0 + rho) { (dx / rho, dy / rho) } else { (1.0, 0.0) };
+            let kern = contract(&field(r, s, rho), tp, tq, cx, cy);
+            inner[0] += kern * (xs * ws);
+            inner[1] += kern * ((1.0 - xs) * ws);
+        }
+        for (a, wa) in [(0, xo * wo), (1, (1.0 - xo) * wo)] {
+            for b in 0..2 {
+                acc[a][b] += inner[b] * wa;
+            }
+        }
+    }
+    acc.map(|r| r.map(|v| v * (lp * lq)))
+}
+
 /// Galerkin integrals of a tabulated reflected field between all pairs of `segs`
 /// (all on the table's side): `K[i*n + j]` for segs[i] (test), segs[j] (source).
 /// Reciprocal, so only j >= i is evaluated.
@@ -534,9 +603,13 @@ pub fn segment_integrals_of(table: &dyn Eval, m: &Mesh, n_q: usize, freq: f64, s
             (i..n)
                 .map(|j| {
                     let (p, q) = (segs[i], segs[j]);
+                    let field = |r: V3, s: V3, rho: f64| table.eval(rho, r[2].abs() + s[2].abs(), freq);
+                    if let Some(h) = graded_height(m, p, q, mid[i], mid[j]) {
+                        return galerkin_graded(m, p, q, h, n_q, field);
+                    }
                     let near = norm(sub(mid[i], mid[j])) < 3.0 * (m.len[p] + m.len[q]);
                     let (pp, pq, nq) = if near { (&pts[i], &pts[j], n_q) } else { (&pts_far[i], &pts_far[j], n_far) };
-                    galerkin(m, p, q, pp, pq, nq, |r, s, rho| table.eval(rho, r[2].abs() + s[2].abs(), freq))
+                    galerkin(m, p, q, pp, pq, nq, field)
                 })
                 .collect()
         })
